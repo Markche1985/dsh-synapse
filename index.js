@@ -984,7 +984,7 @@ function nodeOf(input, workspace, now) {
     title: nodeTitleOf(input?.title),
     collapsed: input?.collapsed === true,
     memberCards: memberCardsOf(input?.memberCards) ?? [],
-    memberNodes: memberNodesOf(input?.memberNodes, workspace) ?? [],
+    memberNodes: memberNodesOf(input?.memberNodes, workspace, base.id) ?? [],
   }
 }
 
@@ -1021,8 +1021,12 @@ function applyNodePatch(node, input, workspace) {
   if (patch.strokeWidth !== undefined) node.strokeWidth = strokeWidthOf(patch.strokeWidth)
   if (patch.fill !== undefined) node.fill = fillOf(patch.fill)
   if (node.type === 'frame' && (patch.memberCards !== undefined || patch.memberNodes !== undefined)) {
-    if (patch.memberCards !== undefined) node.memberCards = memberCardsOf(patch.memberCards) ?? []
-    if (patch.memberNodes !== undefined) node.memberNodes = memberNodesOf(patch.memberNodes, workspace) ?? []
+    // Validate both lists before touching the node: a rejected member list must
+    // not leave half of the patch applied in memory.
+    const memberCards = patch.memberCards !== undefined ? memberCardsOf(patch.memberCards) ?? [] : node.memberCards
+    const memberNodes = patch.memberNodes !== undefined ? memberNodesOf(patch.memberNodes, workspace, node.id) ?? [] : node.memberNodes
+    node.memberCards = memberCards
+    node.memberNodes = memberNodes
     applyFrameMembers(workspace, node)
   }
   node.updatedAt = new Date().toISOString()
@@ -1181,14 +1185,21 @@ function memberCardsOf(value) {
   return keys
 }
 
-function memberNodesOf(value, workspace) {
+function memberNodesOf(value, workspace, selfId = null) {
   if (value === undefined) return undefined
   if (!Array.isArray(value)) throw new InputError('memberNodes 必须是数组')
   if (value.length > MAX_FRAME_MEMBERS) throw new InputError('分组内的元素过多')
   const ids = []
   for (const item of value) {
     if (typeof item !== 'string' || item.length === 0 || item.length > 200) throw new InputError('memberNodes 只接受节点 id')
-    if (!(workspace.nodes ?? []).some(node => node.id === item)) throw new InputError('分组引用的画布元素不存在')
+    // A frame that holds itself — or another frame — can be collapsed into
+    // unreachability: the collapse filter hides every member, the header goes
+    // with it, and the canvas has no way back. Nesting is not modelled anywhere
+    // in the client either, so it is refused instead of guessed.
+    if (selfId !== null && item === selfId) throw new InputError('分组不能包含自身')
+    const target = (workspace.nodes ?? []).find(node => node.id === item)
+    if (target === undefined) throw new InputError('分组引用的画布元素不存在')
+    if (target.type === 'frame') throw new InputError('分组不能嵌套分组')
     if (!ids.includes(item)) ids.push(item)
   }
   return ids

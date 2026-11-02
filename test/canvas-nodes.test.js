@@ -28,6 +28,11 @@ const exported = [
   'nextFrameTitle', 'collapsedFrameMembers', 'rectsIntersect', 'marqueeWorldRect',
   'marqueeSelection', 'normalizeShapeBox', 'defaultShapeGeometry', 'shapeMovePatch',
   'shapeEndpointPatch',
+  // Review A/B regression surface: the two "unconfirmed" protocols and the
+  // smaller hardening helpers.
+  'appendPendingCardPosition', 'pendingCardPositionKeys', 'unconfirmedCardPositionKeys',
+  'workspacePayloadNodes', 'wasOptimisticNodeDeleted', 'pastedPlainText', 'cardSyncKey',
+  'toolbarToolOf',
 ]
 const context = { CARD_WIDTH: 310, CARD_HEIGHT: 276 }
 vm.createContext(context)
@@ -258,6 +263,178 @@ test('translates shapes and drags one endpoint', () => {
   assert.deepEqual(plain(helpers.shapeEndpointPatch({ x2: 0, y2: 0 }, 'to', { x: 9, y: 9 })), { x2: 9, y2: 9 })
   // Coordinates are clamped to the Host range.
   assert.deepEqual(plain(helpers.shapeEndpointPatch({}, 'to', { x: 99999, y: -99999 })), { x2: 5000, y2: -2000 })
+})
+
+// --- review A/B: the two unconfirmed-state protocols ------------------------
+
+test('never lets a Host payload roll back an unconfirmed position', () => {
+  const local = [['thread:turn-index:0', { x: 100, y: 100 }]]
+  const host = { 'thread:turn-index:0': { x: 10, y: 10 }, 'thread:turn-index:1': { x: 20, y: 20 } }
+
+  // Pending or in flight: the Host copy must not win for that key.
+  assert.deepEqual(plain(helpers.mergeCardPositions(local, host, new Set(['thread:turn-index:0']))), [
+    ['thread:turn-index:0', { x: 100, y: 100 }],
+    ['thread:turn-index:1', { x: 20, y: 20 }],
+  ])
+  // Confirmed (no protection): the Host value is applied again.
+  assert.deepEqual(plain(helpers.mergeCardPositions(local, host, [])), [
+    ['thread:turn-index:0', { x: 10, y: 10 }],
+    ['thread:turn-index:1', { x: 20, y: 20 }],
+  ])
+})
+
+test('buckets pending positions per workspace and unions them with in-flight keys', () => {
+  const pending = {}
+  helpers.appendPendingCardPosition(pending, 'ws-a', 't:turn-index:0', { x: 1.4, y: 2.6 })
+  helpers.appendPendingCardPosition(pending, 'ws-b', 't:turn-index:0', { x: 9, y: 9 })
+  helpers.appendPendingCardPosition(pending, 'ws-a', '', { x: 1, y: 1 })
+  helpers.appendPendingCardPosition(pending, 'ws-a', 't:turn-index:1', { x: Number.NaN, y: 1 })
+
+  assert.deepEqual(plain(helpers.pendingCardPositionKeys(pending, 'ws-a')), ['t:turn-index:0'])
+  assert.deepEqual(plain(helpers.pendingCardPositionKeys(pending, 'ws-b')), ['t:turn-index:0'])
+  assert.deepEqual(plain(pending['ws-a']), { 't:turn-index:0': { x: 1, y: 3 } })
+  // The same positionKey carries different values in each workspace bucket: a
+  // switch inside the debounce window can never write A's drag into B.
+  assert.notEqual(pending['ws-a']['t:turn-index:0'].x, pending['ws-b']['t:turn-index:0'].x)
+
+  const inFlight = new Map([['ws-a', new Set(['t:turn-index:7'])]])
+  assert.deepEqual([...helpers.unconfirmedCardPositionKeys(pending, inFlight, 'ws-a')].sort(), ['t:turn-index:0', 't:turn-index:7'])
+  assert.deepEqual([...helpers.unconfirmedCardPositionKeys(pending, inFlight, 'ws-b')], ['t:turn-index:0'])
+  assert.deepEqual([...helpers.unconfirmedCardPositionKeys({}, inFlight, 'ws-c')], [])
+  // The client keeps reference counts per key; any positive count still protects.
+  const counted = new Map([['ws-a', new Map([['t:turn-index:8', 2]])]])
+  assert.deepEqual([...helpers.unconfirmedCardPositionKeys({}, counted, 'ws-a')], ['t:turn-index:8'])
+})
+
+test('keeps the local node version while its PATCH is unconfirmed', () => {
+  const local = [{ id: 'n1', type: 'note', text: '刚才写的字' }, { id: 'tmp:9', type: 'note', text: 'new' }]
+  const host = [{ id: 'n1', type: 'note', text: '旧快照' }, { id: 'n2', type: 'note', text: 'other' }]
+
+  const merged = plain(helpers.mergeWorkspaceNodes(local, host, null, new Set(['n1'])))
+  assert.deepEqual(merged.map(node => node.id), ['n1', 'n2', 'tmp:9'])
+  assert.equal(merged[0].text, '刚才写的字')
+  assert.equal(merged[1].text, 'other')
+  // Once confirmed the Host copy wins again.
+  assert.equal(plain(helpers.mergeWorkspaceNodes(local, host, null, []))[0].text, '旧快照')
+  // pendingNodeDeletes still filters a deleted id, and a dirty+excluded id is gone.
+  assert.deepEqual(plain(helpers.mergeWorkspaceNodes(local, host, ['n1'], new Set(['n1']))).map(node => node.id), ['n2', 'tmp:9'])
+})
+
+test('treats a workspace payload without nodes as "keep the canvas"', () => {
+  assert.deepEqual(plain(helpers.workspacePayloadNodes({ id: 'w', nodes: [] })), [])
+  assert.deepEqual(plain(helpers.workspacePayloadNodes({ id: 'w', nodes: [{ id: 'n1' }] })), [{ id: 'n1' }])
+  // A failed record load has no nodes field: the caller keeps the current canvas.
+  assert.equal(helpers.workspacePayloadNodes({ id: 'w' }), null)
+  assert.equal(helpers.workspacePayloadNodes(null), null)
+  assert.equal(helpers.workspacePayloadNodes({ id: 'w', nodes: 'nope' }), null)
+})
+
+test('recognises a note deleted while its create was in flight', () => {
+  assert.equal(helpers.wasOptimisticNodeDeleted('tmp:1', new Set(['tmp:1'])), true)
+  assert.equal(helpers.wasOptimisticNodeDeleted('tmp:1', new Set()), false)
+  assert.equal(helpers.wasOptimisticNodeDeleted('tmp:1', null), false)
+  assert.equal(helpers.wasOptimisticNodeDeleted('', new Set([''])), false)
+})
+
+test('reads only the plain-text flavour of a paste', () => {
+  const clipboard = {
+    getData: type => (type === 'text/plain' ? '<b>纯文本</b>\n第二行' : '<img src="https://evil.example/x.png">'),
+  }
+  // Whatever text/html says, only text/plain is returned; the caller inserts it as
+  // a text node, so markup and remote images can never be parsed.
+  assert.equal(helpers.pastedPlainText(clipboard), '<b>纯文本</b>\n第二行')
+  assert.equal(helpers.pastedPlainText({ getData: () => null }), '')
+  assert.equal(helpers.pastedPlainText({ getData: () => { throw new Error('denied') } }), '')
+  assert.equal(helpers.pastedPlainText(null), '')
+})
+
+test('syncs card positions only under a durable positionKey', () => {
+  assert.equal(helpers.cardSyncKey(['t:turn-index:2']), 't:turn-index:2')
+  assert.equal(helpers.cardSyncKey(['t:turn-index:2', 't:turn:9']), 't:turn-index:2')
+  // No positionKey → nothing is queued (a card id is not a durable Host key).
+  assert.equal(helpers.cardSyncKey([]), '')
+  assert.equal(helpers.cardSyncKey(['']), '')
+  assert.equal(helpers.cardSyncKey(undefined), '')
+})
+
+test('maps toolbar actions to the canvas tool they activate', () => {
+  assert.equal(helpers.toolbarToolOf('add-note'), 'note')
+  assert.equal(helpers.toolbarToolOf('select-tool'), 'select')
+  assert.equal(helpers.toolbarToolOf('draw-arrow'), 'arrow')
+  assert.equal(helpers.toolbarToolOf('draw-rect'), 'rect')
+  assert.equal(helpers.toolbarToolOf('draw-ellipse'), 'ellipse')
+  for (const action of ['layout', 'group-selection', 'toggle-frame', 'add-image', '', null]) {
+    assert.equal(helpers.toolbarToolOf(action), '', String(action))
+  }
+})
+
+// --- review A/B: the position protocol, executed rather than pattern-matched --
+const protocolSlice = source.slice(
+  source.indexOf('function markCardPositionsInFlight'),
+  source.indexOf('/** Debounce one `PATCH'),
+)
+
+/** Load the in-flight/retry/flush functions with stubbed api + setError. */
+function makeProtocol({ failFirst = 0 } = {}) {
+  const calls = []
+  const errors = []
+  let failures = failFirst
+  const context = {
+    state: { inFlightCardPositionKeys: new Map() },
+    setError: message => { errors.push(message) },
+    api: async (path, options) => {
+      calls.push({ path, body: JSON.parse(options.body) })
+      if (failures > 0) {
+        failures -= 1
+        throw new Error('HTTP 500')
+      }
+      return { workspace: {} }
+    },
+  }
+  vm.createContext(context)
+  vm.runInContext(
+    `let cardPositionSyncPending = {}
+${protocolSlice}
+globalThis.__protocol = { markCardPositionsInFlight, settleInFlightCardPositions, sendCardPositions, flushCardPositionSync, setPending: value => { cardPositionSyncPending = value } }`,
+    context,
+  )
+  return { protocol: context.__protocol, state: context.state, calls, errors }
+}
+
+test('keeps a failed position PATCH unconfirmed after one retry', async () => {
+  const { protocol, state, calls, errors } = makeProtocol({ failFirst: 2 })
+  protocol.markCardPositionsInFlight('ws-a', ['t:turn-index:0'])
+  await protocol.sendCardPositions('ws-a', { 't:turn-index:0': { x: 1, y: 2 } }, ['t:turn-index:0'], 0)
+
+  assert.equal(calls.length, 2)  // exactly one retry
+  assert.equal(errors.length, 1) // reported once
+  // The key stays protected so the next Host snapshot cannot roll it back.
+  assert.equal(state.inFlightCardPositionKeys.get('ws-a').get('t:turn-index:0') >= 1, true)
+})
+
+test('retires the in-flight mark once the retry succeeds', async () => {
+  const { protocol, state, calls, errors } = makeProtocol({ failFirst: 1 })
+  protocol.markCardPositionsInFlight('ws-a', ['t:turn-index:0'])
+  await protocol.sendCardPositions('ws-a', { 't:turn-index:0': { x: 1, y: 2 } }, ['t:turn-index:0'], 0)
+
+  assert.equal(calls.length, 2)
+  assert.equal(errors.length, 0)
+  assert.equal(state.inFlightCardPositionKeys.has('ws-a'), false)
+})
+
+test('flushes each workspace bucket to its own workspace', async () => {
+  const { protocol, calls } = makeProtocol()
+  protocol.setPending({
+    'ws-a': { 't:turn-index:0': { x: 1, y: 2 } },
+    'ws-b': { 't:turn-index:0': { x: 9, y: 9 } },
+  })
+  protocol.flushCardPositionSync()
+  await new Promise(resolve => setTimeout(resolve, 0))
+
+  assert.equal(calls.length, 2)
+  const byWorkspace = new Map(calls.map(call => [decodeURIComponent(call.path.split('/').at(-1)), call.body.cardPositions]))
+  assert.deepEqual(plain(byWorkspace.get('ws-a')), { 't:turn-index:0': { x: 1, y: 2 } })
+  assert.deepEqual(plain(byWorkspace.get('ws-b')), { 't:turn-index:0': { x: 9, y: 9 } })
 })
 
 // --- markup contract (.recon/contract.md §3) -------------------------------
@@ -509,4 +686,91 @@ test('renders the canvas when a workspace has annotations but no threads', () =>
   assert.match(canvas, /threads\.length === 0 && state\.draft\?\.kind !== 'new' && state\.nodes\.size === 0/)
   // The toolbar shows for annotation-only workspaces too, otherwise nothing could be drawn.
   assert.match(source, /threads\.length > 0 \|\| state\.draft\?\.kind === 'new' \|\| state\.nodes\.size > 0/)
+})
+
+// --- review A/B wiring: unconfirmed protocols, failures and small hardening --
+
+test('marks position keys in flight and protects them from Host snapshots', () => {
+  assert.match(source, /inFlightCardPositionKeys/)
+  assert.match(source, /markCardPositionsInFlight\(workspaceId, positionKeys\)/)
+  // Reference-counted marks: overlapping flushes cannot retire each other.
+  assert.match(source, /counts\.set\(key, \(counts\.get\(key\) \?\? 0\) \+ 1\)/)
+  assert.match(source, /function settleInFlightCardPositions\(workspaceId, positionKeys, succeeded\)/)
+  assert.match(source, /settleInFlightCardPositions\(workspaceId, positionKeys, false\)/)
+  assert.match(source, /unconfirmedCardPositionKeys\(cardPositionSyncPending, state\.inFlightCardPositionKeys, workspaceId\)/)
+  assert.match(source, /mergeCardPositions\(\[\.\.\.state\.cardPositions\], record, unconfirmed\)/)
+  // Failure retries exactly once, then surfaces the error and keeps the marks.
+  assert.match(source, /if \(attempt === 0\) \{[\s\S]{0,160}sendCardPositions\(workspaceId, positions, positionKeys, 1\)/)
+  assert.match(source, /setError\(`布局保存失败/)
+})
+
+test('flushes pending positions per workspace bucket', () => {
+  assert.match(source, /let cardPositionSyncPending = \{\}/)
+  assert.match(source, /appendPendingCardPosition\(cardPositionSyncPending, workspaceId, positionKey, position\)/)
+  assert.match(source, /for \(const \[workspaceId, positions\] of Object\.entries\(buckets\)\)/)
+  assert.match(source, /sendCardPositions\(workspaceId, positions, positionKeys, 0\)/)
+})
+
+test('keeps dirty nodes local until their last PATCH succeeds', () => {
+  assert.match(source, /dirtyNodeIds: new Set\(\)/)
+  const patch = source.slice(source.indexOf('async function patchHostNode'), source.indexOf('function createNoteFromPointer'))
+  assert.match(patch, /state\.dirtyNodeIds\.add\(id\)/)
+  assert.match(patch, /settleNodePatch\(id, true\)/)
+  assert.match(patch, /settleNodePatch\(id, false\)/)
+  assert.match(source, /mergeWorkspaceNodes\(\[\.\.\.state\.nodes\.values\(\)\], Array\.isArray\(nodes\) \? nodes : \[\], state\.pendingNodeDeletes, state\.dirtyNodeIds\)/)
+  // A delete settles the node immediately instead of leaving it dirty.
+  assert.match(source, /state\.dirtyNodeIds\.delete\(nodeId\)/)
+  // The protocol must not degrade optimistic creates / pending deletes.
+  assert.match(source, /state\.pendingNodeDeletes\.clear\(\)/)
+  assert.match(source, /node\.id\.startsWith\('tmp:'\)/)
+})
+
+test('persists collapsed-frame members when 整理 resets the layout', () => {
+  const sync = source.slice(source.indexOf('function syncAllCardPositionsToHost'), source.indexOf('function applyWorkspaceNodes'))
+  assert.match(sync, /projectedCardsByKey\(\)\.values\(\)/)
+  assert.doesNotMatch(sync, /const cards = state\.canvasCards \?\? \[\]/)
+})
+
+test('deletes the Host node created for an optimistic note that was removed', () => {
+  const replace = source.slice(source.indexOf('function replaceOptimisticNode'), source.indexOf('function commitNoteText'))
+  assert.match(replace, /wasOptimisticNodeDeleted\(tempId, state\.deletedTempIds\)/)
+  assert.match(replace, /deleteHostNode\(created\.id\)/)
+  assert.match(source, /state\.deletedTempIds\.add\(nodeId\)/)
+  assert.match(source, /state\.deletedTempIds\.clear\(\)/)
+})
+
+test('never blanks the canvas when the workspace record fails to load', () => {
+  const open = source.slice(source.indexOf('async function openDshWorkspace'), source.indexOf('async function openCurrentWorkspace'))
+  assert.doesNotMatch(open, /nodes: record\?\.workspace\?\.nodes \?\? \[\]/)
+  assert.match(open, /Array\.isArray\(recordNodes\) \? \{ nodes: recordNodes \} : \{\}/)
+  const apply = source.slice(source.indexOf('function applyHostWorkspaceData'), source.indexOf('function resetCardPositions'))
+  assert.match(apply, /workspacePayloadNodes\(workspace\)/)
+  assert.match(apply, /if \(payloadNodes !== null\) \{/)
+  // Only an actual payload of the new workspace replaces the collection.
+  assert.match(apply, /if \(switching\) state\.nodes = new Map\(\)/)
+})
+
+test('intercepts note pastes and inserts plain text only', () => {
+  const paste = source.slice(source.indexOf('async function handleCanvasPaste'), source.indexOf('// --- canvas shapes, frames and multi-select'))
+  assert.match(paste, /noteBody instanceof HTMLElement/)
+  assert.match(paste, /event\.preventDefault\(\)[\s\S]{0,220}pastedPlainText\(event\.clipboardData\)/)
+  assert.match(source, /function insertPlainText\(/)
+  assert.match(source, /document\.execCommand\('insertText', false, text\)/)
+  assert.match(source, /document\.createTextNode\(text\)/)
+  // The note body is never written through innerHTML.
+  assert.doesNotMatch(source, /noteBody\.innerHTML/)
+})
+
+test('queues positions only from the durable alias', () => {
+  const remember = source.slice(source.indexOf('function rememberCardPosition'), source.indexOf('/** The Host address of the workspace'))
+  assert.match(remember, /const positionKey = cardSyncKey\(aliases\)/)
+  assert.match(remember, /if \(positionKey !== ''\) queueCardPositionSync\(positionKey/)
+  assert.doesNotMatch(remember, /: cardId,/)
+})
+
+test('keeps the toolbar in step when a draw gesture starts', () => {
+  assert.match(source, /function syncToolButtons\(/)
+  assert.match(source, /toolbarToolOf\(button\.dataset\.action\)/)
+  const draw = source.slice(source.indexOf('function startShapeDraw'), source.indexOf('function startMarqueeGesture'))
+  assert.match(draw, /state\.canvasTool = 'pan'[\s\S]{0,220}syncToolButtons\(\)/)
 })

@@ -433,6 +433,26 @@ test('clamps node geometry and rejects invalid node payloads', async () => {
   await assert.rejects(store.createNode(workspace.id, { type: 'frame', x: 0, y: 0, memberCards: ['card-id'] }), /memberCards 只接受 positionKey/)
 })
 
+test('refuses a frame that would hold itself or another frame', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-frame-nesting-'))
+  const store = new WorkspaceStore(join(directory, 'state.json'))
+  const workspace = await store.create('画布')
+
+  const inner = await store.createNode(workspace.id, { type: 'frame', x: 0, y: 0, title: '内层' })
+  const note = await store.createNode(workspace.id, { type: 'note', x: 0, y: 0 })
+  const outer = await store.createNode(workspace.id, { type: 'frame', x: 0, y: 0, title: '外层', memberNodes: [note.id] })
+  assert.deepEqual(outer.memberNodes, [note.id])
+
+  // Collapsing a frame hides every member; a frame that is its own member would
+  // hide its own header and could never be expanded from the canvas again.
+  await assert.rejects(store.updateNode(outer.id, { memberNodes: [outer.id] }), /分组不能包含自身/)
+  await assert.rejects(store.updateNode(outer.id, { memberNodes: [inner.id] }), /分组不能嵌套分组/)
+
+  // The rejected patch leaves the stored membership untouched.
+  const graph = await store.get(workspace.id)
+  assert.deepEqual(graph.nodes.find(node => node.id === outer.id).memberNodes, [note.id])
+})
+
 test('groups cards into a frame and releases them when the frame is deleted', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-frames-'))
   const store = new WorkspaceStore(join(directory, 'state.json'))

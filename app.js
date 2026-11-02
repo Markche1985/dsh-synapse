@@ -67,6 +67,10 @@ const state = {
   // into this Map; `canvasTool` drives the toolbar, `selectedNodeIds` the
   // `.selected` class, `noteEditingId` the contenteditable that owns the caret.
   nodes: new Map(), canvasTool: 'pan', selectedNodeIds: new Set(), selectedCardKeys: new Set(), noteEditingId: null, pendingNodeDeletes: new Set(),
+  // Two independent "unconfirmed" protocols (review A/B):
+  //  - card positions are keyed by positionKey and tracked per workspace;
+  //  - node writes are keyed by node id (text / x,y / size / collapsed / members).
+  dirtyNodeIds: new Set(), deletedTempIds: new Set(), inFlightCardPositionKeys: new Map(),
   expandedMessageIds: new Set(),
   canvasCards: undefined, canvasCardsById: undefined, canvasGraph: undefined, mountedCardIds: new Set(), canvasNeedsCenter: false,
   detailScrollByThread: new Map(), detailThreadId: null, detailTargetCardId: null,
@@ -101,9 +105,11 @@ function rememberCardPosition(cardId, position, aliases = []) {
   persistCardPositions()
   // The Host is the durable owner of the layout: the desktop app starts on a
   // random port, so the browser origin (and its local storage) changes on every
-  // restart. One debounced PATCH per drag burst; the positionKey is sent, never
-  // the card id, because DSH reassigns `seq` after a pending turn.
-  queueCardPositionSync(typeof aliases[0] === 'string' ? aliases[0] : cardId, { x: Math.round(position.x), y: Math.round(position.y) })
+  // restart. One debounced PATCH per drag burst; only the positionKey is sent, and
+  // a card without one keeps the drag local — the card id is never a durable key
+  // because DSH reassigns `seq` after a pending turn (review Haiku item 8).
+  const positionKey = cardSyncKey(aliases)
+  if (positionKey !== '') queueCardPositionSync(positionKey, { x: Math.round(position.x), y: Math.round(position.y) })
 }
 
 /** The Host address of the workspace on screen (`dsh:` is a client-side prefix). */
@@ -114,12 +120,15 @@ function hostWorkspaceId() {
 }
 
 let cardPositionSyncTimer = 0
-let cardPositionSyncPending = null
+// Pending positions are bucketed per workspace: a drag queued in workspace A must
+// never be written into workspace B after a switch inside the debounce window.
+let cardPositionSyncPending = {}
 
-/** Merge the Host's durable card positions; the Host value wins over the cache. */
-function applyHostCardPositions(record) {
+/** Merge the Host's durable card positions; unconfirmed keys keep their local value. */
+function applyHostCardPositions(record, workspaceId = hostWorkspaceId()) {
   if (record === null || typeof record !== 'object' || Array.isArray(record)) return false
-  const merged = new Map(mergeCardPositions([...state.cardPositions], record))
+  const unconfirmed = unconfirmedCardPositionKeys(cardPositionSyncPending, state.inFlightCardPositionKeys, workspaceId)
+  const merged = new Map(mergeCardPositions([...state.cardPositions], record, unconfirmed))
   let changed = false
   for (const [key, value] of merged) {
     const previous = state.cardPositions.get(key)
@@ -131,42 +140,108 @@ function applyHostCardPositions(record) {
   return true
 }
 
+function markCardPositionsInFlight(workspaceId, positionKeys) {
+  if (typeof workspaceId !== 'string' || workspaceId === '') return
+  let counts = state.inFlightCardPositionKeys.get(workspaceId)
+  if (counts === undefined) {
+    counts = new Map()
+    state.inFlightCardPositionKeys.set(workspaceId, counts)
+  }
+  // Reference-counted: two overlapping flushes for the same key must not clear
+  // each other's protection when the first one settles.
+  for (const key of positionKeys) counts.set(key, (counts.get(key) ?? 0) + 1)
+}
+
+/** Retire the marks of one settled send unless the key is still unconfirmed. */
+function settleInFlightCardPositions(workspaceId, positionKeys, succeeded) {
+  const counts = state.inFlightCardPositionKeys.get(workspaceId)
+  if (counts === undefined) return
+  const pendingBucket = cardPositionSyncPending[workspaceId]
+  for (const key of positionKeys) {
+    const remaining = (counts.get(key) ?? 1) - 1
+    if (remaining > 0) {
+      counts.set(key, remaining)
+      continue
+    }
+    if (!succeeded) {
+      // A failed write stays unconfirmed until a later send succeeds.
+      counts.set(key, 1)
+      continue
+    }
+    if (pendingBucket !== undefined && pendingBucket[key] !== undefined) counts.set(key, 1)
+    else counts.delete(key)
+  }
+  if (counts.size === 0) state.inFlightCardPositionKeys.delete(workspaceId)
+}
+
+/** Send one workspace bucket, retry once, then surface the failure and keep marks. */
+async function sendCardPositions(workspaceId, positions, positionKeys, attempt) {
+  try {
+    await api(`/synapse/api/workspaces/${encodeURIComponent(workspaceId)}`, { method: 'PATCH', body: JSON.stringify({ cardPositions: positions }) })
+  } catch (error) {
+    if (attempt === 0) {
+      await sendCardPositions(workspaceId, positions, positionKeys, 1)
+      return
+    }
+    settleInFlightCardPositions(workspaceId, positionKeys, false)
+    setError(`布局保存失败：${error instanceof Error ? error.message : 'Host 未响应'}`)
+    // The marks stay: the local value is still unconfirmed, so the Host copy must
+    // not win until a later flush succeeds.
+    return
+  }
+  settleInFlightCardPositions(workspaceId, positionKeys, true)
+}
+
+/** Flush every workspace bucket to its own workspace (never cross-writes). */
+function flushCardPositionSync() {
+  const buckets = cardPositionSyncPending
+  cardPositionSyncPending = {}
+  for (const [workspaceId, positions] of Object.entries(buckets)) {
+    const positionKeys = Object.keys(positions)
+    if (workspaceId === '' || positionKeys.length === 0) continue
+    markCardPositionsInFlight(workspaceId, positionKeys)
+    void sendCardPositions(workspaceId, positions, positionKeys, 0)
+  }
+}
+
 /** Debounce one `PATCH /workspaces/:id {cardPositions}` per drag burst. */
 function queueCardPositionSync(positionKey, position) {
   const workspaceId = hostWorkspaceId()
-  if (workspaceId === null || typeof positionKey !== 'string' || positionKey === '') return
-  if (cardPositionSyncPending === null) cardPositionSyncPending = {}
-  cardPositionSyncPending[positionKey] = position
+  if (workspaceId === null) return
+  appendPendingCardPosition(cardPositionSyncPending, workspaceId, positionKey, position)
   if (cardPositionSyncTimer !== 0) return
   cardPositionSyncTimer = window.setTimeout(() => {
     cardPositionSyncTimer = 0
-    const body = cardPositionSyncPending
-    cardPositionSyncPending = null
-    if (body === null) return
-    // Best effort: an older Host without the route keeps the local cache as the
-    // source of truth, so a failed sync must never surface as a canvas error.
-    void api(`/synapse/api/workspaces/${encodeURIComponent(workspaceId)}`, { method: 'PATCH', body: JSON.stringify({ cardPositions: body }) })
-      .catch(() => { /* private mode / older Host: localStorage still has the layout */ })
+    flushCardPositionSync()
   }, CARD_POSITION_SYNC_DELAY)
 }
 
 let appliedWorkspaceId = null
+const nodePatchCounts = new Map()
 
-/** Persist every card's current position (整理 resets the layout, not only the cache). */
+/**
+ * Persist every card's current position (整理 resets the layout, not only the
+ * cache). Reads the full projection, so cards hidden inside a collapsed frame are
+ * persisted too (review K3.1 item 4).
+ */
 function syncAllCardPositionsToHost() {
-  const cards = state.canvasCards ?? []
+  const cards = state.workspace === null || state.workspace === undefined
+    ? (state.canvasCards ?? [])
+    : [...projectedCardsByKey().values()]
+  const seen = new Set()
   for (const card of cards) {
     const positionKey = cardPositionKey(card)
-    if (positionKey === '' || card.position === null || card.position === undefined) continue
+    if (positionKey === '' || seen.has(positionKey) || card.position === null || card.position === undefined) continue
+    seen.add(positionKey)
     queueCardPositionSync(positionKey, { x: Math.round(card.position.x), y: Math.round(card.position.y) })
   }
 }
 
-/** Replace the node collection with the Host's copy, keeping unconfirmed creates. */
+/** Replace the node collection with the Host's copy, keeping unconfirmed writes. */
 function applyWorkspaceNodes(nodes) {
   // Never yank the node the user is typing into: the next payload after blur wins.
   if (state.noteEditingId !== null) return false
-  const merged = mergeWorkspaceNodes([...state.nodes.values()], Array.isArray(nodes) ? nodes : [], state.pendingNodeDeletes)
+  const merged = mergeWorkspaceNodes([...state.nodes.values()], Array.isArray(nodes) ? nodes : [], state.pendingNodeDeletes, state.dirtyNodeIds)
   state.nodes = new Map(merged.map(node => [node.id, node]))
   return true
 }
@@ -177,21 +252,30 @@ function applyHostWorkspaceData(workspace) {
   // `dsh:<uuid>` and `<uuid>` are the same Host workspace: normalise so the
   // first poll after `openDshWorkspace` does not look like a switch.
   const workspaceId = typeof workspace.id === 'string' && workspace.id.startsWith('dsh:') ? workspace.id.slice(4) : workspace.id
-  if (appliedWorkspaceId !== workspaceId) {
-    // A workspace switch must not carry another canvas's nodes or selection into
-    // this one; the incoming payload below repopulates it.
+  const switching = appliedWorkspaceId !== workspaceId
+  if (switching) {
+    // A workspace switch must not carry another canvas's selection or pending
+    // writes into this one; the incoming payload repopulates the nodes.
     appliedWorkspaceId = workspaceId
-    state.nodes = new Map()
     state.selectedNodeIds.clear()
     state.selectedCardKeys.clear()
     state.selectedCardId = null
     state.pendingNodeDeletes.clear()
+    state.deletedTempIds.clear()
+    state.dirtyNodeIds.clear()
+    nodePatchCounts.clear()
     state.canvasTool = 'pan'
   }
-  applyWorkspaceNodes(workspace.nodes)
-  // A queued drag PATCH has not reached the Host yet; applying its older copy
-  // would snap the card back for one poll tick.
-  if (cardPositionSyncTimer === 0 && cardPositionSyncPending === null) applyHostCardPositions(workspace.cardPositions)
+  // A failed workspace load must not blank the canvas: only an actual nodes array
+  // replaces the collection (review Haiku item 6).
+  const payloadNodes = workspacePayloadNodes(workspace)
+  if (payloadNodes !== null) {
+    if (switching) state.nodes = new Map()
+    applyWorkspaceNodes(payloadNodes)
+  }
+  // Unconfirmed keys are protected inside applyHostCardPositions, so the Host copy
+  // is merged on every payload instead of being skipped wholesale.
+  applyHostCardPositions(workspace.cardPositions, workspaceId)
 }
 
 function resetCardPositions() {
@@ -318,7 +402,18 @@ async function openDshWorkspace(id, { renderAfter = true, preserveCanvasCamera =
     if (load !== state.workspaceLoad) return true
     const nextWorkspaceId = `dsh:${workspace.id}`
     if (state.workspace?.id !== nextWorkspaceId && !preserveCanvasCamera) resetCanvasCamera()
-    state.workspace = { id: nextWorkspaceId, title: workspace.title, cwd: workspace.path, threads, nodes: record?.workspace?.nodes ?? [], cardPositions: record?.workspace?.cardPositions ?? {} }
+    const recordNodes = record?.workspace?.nodes
+    const recordPositions = record?.workspace?.cardPositions
+    state.workspace = {
+      id: nextWorkspaceId,
+      title: workspace.title,
+      cwd: workspace.path,
+      threads,
+      // A failed record load must not replace the canvas with an empty node list;
+      // only an actual payload is attached (review Haiku item 6).
+      ...(Array.isArray(recordNodes) ? { nodes: recordNodes } : {}),
+      ...(recordPositions !== null && typeof recordPositions === 'object' ? { cardPositions: recordPositions } : {}),
+    }
     applyHostWorkspaceData(state.workspace)
     state.workspaceFingerprint = JSON.stringify(state.workspace)
     const currentThread = currentDshThread(state.workspace.threads)
@@ -1383,8 +1478,15 @@ function groupBoundsOf(cards, nodes, padding = 28, headerHeight = 34) {
   return boundsOfBoxes(boxes, padding, headerHeight)
 }
 
-/** Merge Host card positions over the local cache; the Host wins per key. */
-function mergeCardPositions(localPairs, hostRecord) {
+/**
+ * Merge Host card positions over the local cache; the Host wins per key **except**
+ * for unconfirmed keys, which keep the local value (review P0: a failed or racing
+ * position PATCH used to be silently rolled back by the next poll).
+ */
+function mergeCardPositions(localPairs, hostRecord, protectedKeys = null) {
+  const protectedSet = protectedKeys !== null && typeof protectedKeys?.has === 'function'
+    ? protectedKeys
+    : new Set(Array.isArray(protectedKeys) ? protectedKeys : [])
   const merged = new Map()
   const readable = value => value !== null && typeof value === 'object' && !Array.isArray(value) && Number.isFinite(value.x) && Number.isFinite(value.y)
   for (const pair of Array.isArray(localPairs) ? localPairs : []) {
@@ -1394,28 +1496,65 @@ function mergeCardPositions(localPairs, hostRecord) {
   const host = hostRecord !== null && typeof hostRecord === 'object' && !Array.isArray(hostRecord) ? hostRecord : {}
   for (const [key, value] of Object.entries(host)) {
     if (typeof key !== 'string' || key === '' || !readable(value)) continue
+    if (protectedSet.has(key)) continue
     merged.set(key, { x: Math.round(value.x), y: Math.round(value.y) })
   }
   return [...merged]
 }
 
+/** Add one debounced position to its workspace bucket (pure, testable). */
+function appendPendingCardPosition(pending, workspaceId, positionKey, position) {
+  if (pending === null || typeof pending !== 'object') return pending
+  if (typeof workspaceId !== 'string' || workspaceId === '' || typeof positionKey !== 'string' || positionKey === '') return pending
+  const x = Number(position?.x)
+  const y = Number(position?.y)
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return pending
+  const bucket = pending[workspaceId] !== null && typeof pending[workspaceId] === 'object' ? pending[workspaceId] : {}
+  bucket[positionKey] = { x: Math.round(x), y: Math.round(y) }
+  pending[workspaceId] = bucket
+  return pending
+}
+
+/** Keys waiting in one workspace bucket. */
+function pendingCardPositionKeys(pending, workspaceId) {
+  const bucket = pending !== null && typeof pending === 'object' ? pending[workspaceId] : undefined
+  return bucket !== null && typeof bucket === 'object' ? Object.keys(bucket) : []
+}
+
+/** Keys that must not be overwritten by a Host payload (pending + in flight). */
+function unconfirmedCardPositionKeys(pending, inFlight, workspaceId) {
+  const keys = new Set(pendingCardPositionKeys(pending, workspaceId))
+  const inFlightKeys = inFlight !== null && inFlight !== undefined && typeof inFlight.get === 'function' ? inFlight.get(workspaceId) : undefined
+  // Works for a Set and for the reference-counted Map the client keeps.
+  if (inFlightKeys !== null && inFlightKeys !== undefined && typeof inFlightKeys.keys === 'function') {
+    for (const key of inFlightKeys.keys()) keys.add(key)
+  }
+  return keys
+}
+
 /**
  * Merge the Host node list with the local one: server nodes win by id, `tmp:`
- * nodes the client created optimistically survive until confirmed, and ids the
- * user just deleted are filtered out until the Host acknowledges the delete.
+ * nodes the client created optimistically survive until confirmed, ids the user
+ * just deleted are filtered out until acknowledged, and ids with an unconfirmed
+ * PATCH keep the local version instead of the Host snapshot.
  */
-function mergeWorkspaceNodes(existing, incoming, excludedIds = null) {
+function mergeWorkspaceNodes(existing, incoming, excludedIds = null, keepLocalIds = null) {
   // Accept any Set-like (a `Set` from another realm fails `instanceof`) or array.
-  const excluded = excludedIds !== null && typeof excludedIds?.has === 'function'
-    ? excludedIds
-    : new Set(Array.isArray(excludedIds) ? excludedIds : [])
+  const asSet = value => value !== null && typeof value?.has === 'function' ? value : new Set(Array.isArray(value) ? value : [])
+  const excluded = asSet(excludedIds)
+  const keepLocal = asSet(keepLocalIds)
+  const localById = new Map()
+  for (const node of Array.isArray(existing) ? existing : []) {
+    if (node !== null && typeof node === 'object' && typeof node.id === 'string' && !localById.has(node.id)) localById.set(node.id, node)
+  }
   const result = []
   const seen = new Set()
   const push = node => {
     if (node === null || typeof node !== 'object' || typeof node.id !== 'string' || node.id === '' || seen.has(node.id)) return
     if (excluded.has(node.id)) return
     seen.add(node.id)
-    result.push(node)
+    const local = keepLocal.has(node.id) ? localById.get(node.id) : undefined
+    result.push(local === undefined ? node : local)
   }
   for (const node of Array.isArray(incoming) ? incoming : []) push(node)
   for (const node of Array.isArray(existing) ? existing : []) {
@@ -1423,6 +1562,39 @@ function mergeWorkspaceNodes(existing, incoming, excludedIds = null) {
     push(node)
   }
   return result
+}
+
+/** The workspace payload's node list, or null when the load carried no nodes. */
+function workspacePayloadNodes(workspace) {
+  return workspace !== null && typeof workspace === 'object' && Array.isArray(workspace.nodes) ? workspace.nodes : null
+}
+
+/** Whether the user deleted an optimistic node while its create was in flight. */
+function wasOptimisticNodeDeleted(tempId, deletedTempIds) {
+  if (typeof tempId !== 'string' || tempId === '') return false
+  if (deletedTempIds === null || deletedTempIds === undefined || typeof deletedTempIds.has !== 'function') return false
+  return deletedTempIds.has(tempId)
+}
+
+/** The plain-text payload of a paste event; never trusts text/html (XSS). */
+function pastedPlainText(clipboardData) {
+  if (clipboardData === null || typeof clipboardData !== 'object' || typeof clipboardData.getData !== 'function') return ''
+  let text = ''
+  try { text = clipboardData.getData('text/plain') ?? '' } catch { text = '' }
+  return typeof text === 'string' ? text : ''
+}
+
+/** The durable positionKey a drag may sync; a card id is never a Host key. */
+function cardSyncKey(aliases) {
+  return Array.isArray(aliases) && typeof aliases[0] === 'string' && aliases[0] !== '' ? aliases[0] : ''
+}
+
+/** Toolbar button action → the `state.canvasTool` value it activates. */
+function toolbarToolOf(action) {
+  if (typeof action !== 'string') return ''
+  if (action === 'add-note') return 'note'
+  if (action === 'select-tool') return 'select'
+  return action.startsWith('draw-') ? action.slice(5) : ''
 }
 
 /** Next free frame title (`分组 N`), based on the titles already on the canvas. */
@@ -2604,9 +2776,34 @@ async function createHostNode(payload) {
   return body.node
 }
 
+/**
+ * Track parallel PATCHes per node id. A node stays dirty until its last in-flight
+ * write succeeds; a failed write keeps it dirty so the next Host snapshot cannot
+ * roll the local value back (review P0).
+ */
+function settleNodePatch(nodeId, succeeded) {
+  if (nodeId === '') return
+  const remaining = (nodePatchCounts.get(nodeId) ?? 1) - 1
+  if (remaining > 0) nodePatchCounts.set(nodeId, remaining)
+  else nodePatchCounts.delete(nodeId)
+  if (succeeded && remaining <= 0) state.dirtyNodeIds.delete(nodeId)
+}
+
 async function patchHostNode(nodeId, patch) {
-  const body = await api(`/synapse/api/nodes/${encodeURIComponent(nodeId)}`, { method: 'PATCH', body: JSON.stringify(patch) })
-  return body.node
+  const id = typeof nodeId === 'string' ? nodeId : ''
+  if (id !== '') {
+    nodePatchCounts.set(id, (nodePatchCounts.get(id) ?? 0) + 1)
+    state.dirtyNodeIds.add(id)
+  }
+  try {
+    const body = await api(`/synapse/api/nodes/${encodeURIComponent(nodeId)}`, { method: 'PATCH', body: JSON.stringify(patch) })
+    settleNodePatch(id, true)
+    return body.node
+  } catch (error) {
+    // Keep the node dirty: the local value is unconfirmed until a later PATCH wins.
+    settleNodePatch(id, false)
+    throw error
+  }
 }
 
 async function deleteHostNode(nodeId) {
@@ -2644,14 +2841,24 @@ function createNoteAt(point) {
   void createHostNode({ type: 'note', x: node.x, y: node.y, width: node.width, height: node.height, text: node.text, color: node.color })
     .then(created => replaceOptimisticNode(node.id, created))
     .catch(error => {
+      const deleted = state.deletedTempIds.has(node.id)
+      state.deletedTempIds.delete(node.id)
       state.nodes.delete(node.id)
       state.selectedNodeIds.delete(node.id)
       render()
-      setError(`便签保存失败：${error instanceof Error ? error.message : 'Host 未响应'}`)
+      if (!deleted) setError(`便签保存失败：${error instanceof Error ? error.message : 'Host 未响应'}`)
     })
 }
 
 function replaceOptimisticNode(tempId, created) {
+  if (wasOptimisticNodeDeleted(tempId, state.deletedTempIds)) {
+    state.deletedTempIds.delete(tempId)
+    // The user removed the optimistic note while the create was in flight: put
+    // nothing back on the canvas and remove the Host node the POST just created
+    // (review Haiku item 5).
+    void deleteHostNode(created.id).catch(error => setError(`删除失败：${error instanceof Error ? error.message : 'Host 未响应'}`))
+    return
+  }
   const local = state.nodes.get(tempId)
   const next = { ...created }
   if (local !== undefined) {
@@ -2698,9 +2905,15 @@ async function deleteCanvasNode(nodeId) {
   state.nodes.delete(nodeId)
   state.selectedNodeIds.delete(nodeId)
   state.pendingNodeDeletes.add(nodeId)
+  // A delete supersedes any in-flight PATCH for this node.
+  state.dirtyNodeIds.delete(nodeId)
+  nodePatchCounts.delete(nodeId)
   render()
   if (nodeId.startsWith('tmp:')) {
+    // The create may still resolve: remember the temp id so the receipt deletes the
+    // Host node instead of resurrecting it on the canvas (review Haiku item 5).
     state.pendingNodeDeletes.delete(nodeId)
+    state.deletedTempIds.add(nodeId)
     return
   }
   try {
@@ -2803,25 +3016,52 @@ async function addImageFiles(files, point) {
   }
 }
 
+/** Insert literal text into a contenteditable while keeping the undo stack. */
+function insertPlainText(element, text) {
+  if (!(element instanceof HTMLElement) || typeof text !== 'string' || text === '') return
+  if (typeof document.execCommand === 'function') {
+    try {
+      if (document.execCommand('insertText', false, text)) return
+    } catch { /* fall through to a manual range insert */ }
+  }
+  const selection = window.getSelection()
+  const range = selection !== null && selection.rangeCount > 0 ? selection.getRangeAt(0) : null
+  if (selection === null || range === null || !element.contains(range.commonAncestorContainer)) {
+    element.append(document.createTextNode(text))
+    return
+  }
+  range.deleteContents()
+  const node = document.createTextNode(text)
+  range.insertNode(node)
+  range.setStartAfter(node)
+  range.collapse(true)
+  selection.removeAllRanges()
+  selection.addRange(range)
+}
+
 async function handleCanvasPaste(event) {
   if (state.mode !== 'canvas') return
+  const activeElement = document.activeElement
+  const editable = activeElement instanceof Element ? activeElement.closest('textarea, input, select, [contenteditable="true"], [data-draft]') : null
+  const noteBody = editable === null ? null : editable.closest('.canvas-note-body')
   const items = Array.from(event.clipboardData?.items ?? [])
   const files = items
     .filter(item => item.kind === 'file' && isImageMediaType(item.type))
     .map(item => item.getAsFile())
     .filter(file => file instanceof File)
-  if (files.length === 0) return
-  const activeElement = document.activeElement
-  const editable = activeElement instanceof Element ? activeElement.closest('textarea, input, select, [contenteditable="true"], [data-draft]') : null
-  if (editable !== null) {
-    // A note body is text-only (an <img> dropped into it would be lost on the
-    // next morph); the composer keeps its own paste behaviour.
-    if (editable.closest('[contenteditable="true"]') !== null) {
-      event.preventDefault()
-      setError('便签只能输入文字；图片请粘贴到画布空白处')
-    }
+  if (noteBody instanceof HTMLElement) {
+    // A note is plain text: the clipboard's HTML/image flavour must never land in
+    // the contenteditable, so the paste is always intercepted and only the plain
+    // text payload is inserted (review K3.1 item 7).
+    event.preventDefault()
+    const text = pastedPlainText(event.clipboardData)
+    if (text !== '') insertPlainText(noteBody, normalizeNoteText(text))
+    else if (files.length > 0) setError('便签只能输入文字；图片请粘贴到画布空白处')
     return
   }
+  if (files.length === 0) return
+  // The composer/input keeps its own paste behaviour.
+  if (editable !== null) return
   event.preventDefault()
   await addImageFiles(files, lastPointerWorld ?? canvasCenterWorld())
 }
@@ -2884,11 +3124,24 @@ function applyShapeGeometry(element, node) {
   }
 }
 
+/** Mirror `state.canvasTool` onto the toolbar buttons (active + aria-pressed). */
+function syncToolButtons() {
+  for (const button of document.querySelectorAll('.canvas-controls [data-action]')) {
+    if (!(button instanceof HTMLElement)) continue
+    const tool = toolbarToolOf(button.dataset.action)
+    if (tool === '') continue
+    const active = state.canvasTool === tool
+    button.classList.toggle('active', active)
+    button.setAttribute('aria-pressed', String(active))
+  }
+}
+
 /** Press-drag-release draws a shape; a plain click uses the default size. */
 function startShapeDraw(viewport, event, tool) {
   const layer = document.querySelector('.shapes-layer')
   if (!(layer instanceof SVGElement)) {
     state.canvasTool = 'pan'
+    syncToolButtons()
     return
   }
   const tag = tool === 'arrow' || tool === 'line' ? 'line' : tool === 'ellipse' ? 'ellipse' : 'rect'
@@ -2902,6 +3155,9 @@ function startShapeDraw(viewport, event, tool) {
   let moved = false
   let stopped = false
   state.canvasTool = 'pan'
+  // The tool left the toolbar the moment the press landed; keep its highlight in
+  // step without waiting for the commit render (review Haiku item 9).
+  syncToolButtons()
   state.dragging = true
   const paint = () => {
     if (tag === 'line') {
