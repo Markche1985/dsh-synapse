@@ -152,44 +152,58 @@ function markCardPositionsInFlight(workspaceId, positionKeys) {
   for (const key of positionKeys) counts.set(key, (counts.get(key) ?? 0) + 1)
 }
 
-/** Retire the marks of one settled send unless the key is still unconfirmed. */
-function settleInFlightCardPositions(workspaceId, positionKeys, succeeded) {
+/**
+ * Retire the marks of one settled send. The count means "a request is on the
+ * wire", never "this key is unconfirmed": a queued-but-unsent value is already
+ * protected by its own pending bucket, so folding the two together (as an earlier
+ * revision did) left a permanent `1` behind whenever a drag landed while a send
+ * was in flight — pinning that card's position against every later Host payload.
+ */
+function settleInFlightCardPositions(workspaceId, positionKeys) {
   const counts = state.inFlightCardPositionKeys.get(workspaceId)
   if (counts === undefined) return
-  const pendingBucket = cardPositionSyncPending[workspaceId]
   for (const key of positionKeys) {
     const remaining = (counts.get(key) ?? 1) - 1
-    if (remaining > 0) {
-      counts.set(key, remaining)
-      continue
-    }
-    if (!succeeded) {
-      // A failed write stays unconfirmed until a later send succeeds.
-      counts.set(key, 1)
-      continue
-    }
-    if (pendingBucket !== undefined && pendingBucket[key] !== undefined) counts.set(key, 1)
+    if (remaining > 0) counts.set(key, remaining)
     else counts.delete(key)
   }
   if (counts.size === 0) state.inFlightCardPositionKeys.delete(workspaceId)
 }
 
-/** Send one workspace bucket, retry once, then surface the failure and keep marks. */
+/** One retry, then the failure surfaces; the value stays queued and protected. */
+const CARD_POSITION_MAX_ATTEMPTS = 2
+
+/**
+ * Send one workspace bucket, retrying once. A failed write is put back into the
+ * pending bucket: that keeps the local value unconfirmed (no silent rollback by an
+ * older Host snapshot) and gives the next flush something to retry. A successful
+ * write clears its own queued copy only when the queued value is still the one
+ * that was sent — a drag that landed mid-flight must survive.
+ */
 async function sendCardPositions(workspaceId, positions, positionKeys, attempt) {
   try {
     await api(`/synapse/api/workspaces/${encodeURIComponent(workspaceId)}`, { method: 'PATCH', body: JSON.stringify({ cardPositions: positions }) })
   } catch (error) {
-    if (attempt === 0) {
-      await sendCardPositions(workspaceId, positions, positionKeys, 1)
+    settleInFlightCardPositions(workspaceId, positionKeys)
+    const bucket = cardPositionSyncPending[workspaceId] ?? (cardPositionSyncPending[workspaceId] = {})
+    for (const key of positionKeys) if (positions[key] !== undefined) bucket[key] = positions[key]
+    if (attempt + 1 < CARD_POSITION_MAX_ATTEMPTS) {
+      await sendCardPositions(workspaceId, positions, positionKeys, attempt + 1)
       return
     }
-    settleInFlightCardPositions(workspaceId, positionKeys, false)
     setError(`布局保存失败：${error instanceof Error ? error.message : 'Host 未响应'}`)
-    // The marks stay: the local value is still unconfirmed, so the Host copy must
-    // not win until a later flush succeeds.
     return
   }
-  settleInFlightCardPositions(workspaceId, positionKeys, true)
+  settleInFlightCardPositions(workspaceId, positionKeys)
+  const bucket = cardPositionSyncPending[workspaceId]
+  if (bucket === undefined) return
+  for (const key of positionKeys) {
+    const queued = bucket[key]
+    if (queued === undefined) continue
+    const sent = positions[key]
+    if (sent !== undefined && queued.x === sent.x && queued.y === sent.y) delete bucket[key]
+  }
+  if (Object.keys(bucket).length === 0) delete cardPositionSyncPending[workspaceId]
 }
 
 /** Flush every workspace bucket to its own workspace (never cross-writes). */
@@ -218,6 +232,8 @@ function queueCardPositionSync(positionKey, position) {
 
 let appliedWorkspaceId = null
 const nodePatchCounts = new Map()
+/** Per-node promise chain: keeps PATCHes for one node in call order. */
+const nodePatchChains = new Map()
 
 /**
  * Persist every card's current position (整理 resets the layout, not only the
@@ -261,9 +277,13 @@ function applyHostWorkspaceData(workspace) {
     state.selectedCardKeys.clear()
     state.selectedCardId = null
     state.pendingNodeDeletes.clear()
-    state.deletedTempIds.clear()
+    // `deletedTempIds` deliberately survives the switch: a create POST issued in
+    // the workspace being left can still land afterwards, and dropping the
+    // tombstone there would let the reply resurrect a note the user deleted.
+    // Entries are short-lived — each is removed by its own create callback.
     state.dirtyNodeIds.clear()
     nodePatchCounts.clear()
+    nodePatchChains.clear()
     state.canvasTool = 'pan'
   }
   // A failed workspace load must not blank the canvas: only an actual nodes array
@@ -2785,8 +2805,28 @@ function settleNodePatch(nodeId, succeeded) {
   if (nodeId === '') return
   const remaining = (nodePatchCounts.get(nodeId) ?? 1) - 1
   if (remaining > 0) nodePatchCounts.set(nodeId, remaining)
-  else nodePatchCounts.delete(nodeId)
+  else {
+    // Nothing is outstanding for this node, so the sequencing handle is no longer
+    // needed: the map stays bounded by nodes with a write in flight.
+    nodePatchCounts.delete(nodeId)
+    nodePatchChains.delete(nodeId)
+  }
   if (succeeded && remaining <= 0) state.dirtyNodeIds.delete(nodeId)
+}
+
+/**
+ * Run `send` after every earlier PATCH for the same node has settled. Without
+ * this, two overlapping PATCHes settle in completion order: a slow older write
+ * could land last, clear the dirty mark, and let the next snapshot adopt the
+ * stale value it had just written.
+ */
+function chainNodePatch(nodeId, send) {
+  const previous = nodePatchChains.get(nodeId) ?? Promise.resolve()
+  // `.then(send, send)` so one failure cannot cancel the writes queued behind it.
+  const settled = previous.then(send, send)
+  // The tail never rejects: it exists to order the next call, not to be awaited.
+  nodePatchChains.set(nodeId, settled.then(() => undefined, () => undefined))
+  return settled
 }
 
 async function patchHostNode(nodeId, patch) {
@@ -2795,8 +2835,9 @@ async function patchHostNode(nodeId, patch) {
     nodePatchCounts.set(id, (nodePatchCounts.get(id) ?? 0) + 1)
     state.dirtyNodeIds.add(id)
   }
+  const send = () => api(`/synapse/api/nodes/${encodeURIComponent(nodeId)}`, { method: 'PATCH', body: JSON.stringify(patch) })
   try {
-    const body = await api(`/synapse/api/nodes/${encodeURIComponent(nodeId)}`, { method: 'PATCH', body: JSON.stringify(patch) })
+    const body = await (id === '' ? send() : chainNodePatch(id, send))
     settleNodePatch(id, true)
     return body.node
   } catch (error) {

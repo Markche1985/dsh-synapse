@@ -395,7 +395,7 @@ function makeProtocol({ failFirst = 0 } = {}) {
   vm.runInContext(
     `let cardPositionSyncPending = {}
 ${protocolSlice}
-globalThis.__protocol = { markCardPositionsInFlight, settleInFlightCardPositions, sendCardPositions, flushCardPositionSync, setPending: value => { cardPositionSyncPending = value } }`,
+globalThis.__protocol = { markCardPositionsInFlight, settleInFlightCardPositions, sendCardPositions, flushCardPositionSync, setPending: value => { cardPositionSyncPending = value }, pending: () => cardPositionSyncPending }`,
     context,
   )
   return { protocol: context.__protocol, state: context.state, calls, errors }
@@ -408,8 +408,27 @@ test('keeps a failed position PATCH unconfirmed after one retry', async () => {
 
   assert.equal(calls.length, 2)  // exactly one retry
   assert.equal(errors.length, 1) // reported once
-  // The key stays protected so the next Host snapshot cannot roll it back.
-  assert.equal(state.inFlightCardPositionKeys.get('ws-a').get('t:turn-index:0') >= 1, true)
+  // The failure is kept unconfirmed by the *pending* bucket, not by a leftover
+  // in-flight count: the count only ever means "a request is on the wire".
+  assert.equal(state.inFlightCardPositionKeys.has('ws-a'), false)
+  const pending = protocol.pending()
+  assert.deepEqual(pending['ws-a']['t:turn-index:0'], { x: 1, y: 2 })
+})
+
+test('never leaves an in-flight count behind when a drag lands mid-flight', async () => {
+  // The leak the reviewers found: settling while a newer value is queued used to
+  // keep a permanent `1`, which pinned that card's position against every later
+  // Host payload. A queued value protects itself, so the count must reach 0.
+  const { protocol, state } = makeProtocol({ failFirst: 0 })
+  protocol.setPending({ 'ws-a': { 't:turn-index:0': { x: 9, y: 9 } } })
+  protocol.markCardPositionsInFlight('ws-a', ['t:turn-index:0'])
+  protocol.markCardPositionsInFlight('ws-a', ['t:turn-index:0'])
+  protocol.settleInFlightCardPositions('ws-a', ['t:turn-index:0'])
+  protocol.settleInFlightCardPositions('ws-a', ['t:turn-index:0'])
+
+  assert.equal(state.inFlightCardPositionKeys.has('ws-a'), false)
+  // The queued value still protects the key while it waits for its own flush.
+  assert.deepEqual(plain(protocol.pending())['ws-a']['t:turn-index:0'], { x: 9, y: 9 })
 })
 
 test('retires the in-flight mark once the retry succeeds', async () => {
@@ -420,6 +439,9 @@ test('retires the in-flight mark once the retry succeeds', async () => {
   assert.equal(calls.length, 2)
   assert.equal(errors.length, 0)
   assert.equal(state.inFlightCardPositionKeys.has('ws-a'), false)
+  // A successful write of the queued value clears it, so the key stops being
+  // protected and later Host updates are visible again.
+  assert.deepEqual(plain(protocol.pending()), {})
 })
 
 test('flushes each workspace bucket to its own workspace', async () => {
@@ -695,12 +717,14 @@ test('marks position keys in flight and protects them from Host snapshots', () =
   assert.match(source, /markCardPositionsInFlight\(workspaceId, positionKeys\)/)
   // Reference-counted marks: overlapping flushes cannot retire each other.
   assert.match(source, /counts\.set\(key, \(counts\.get\(key\) \?\? 0\) \+ 1\)/)
-  assert.match(source, /function settleInFlightCardPositions\(workspaceId, positionKeys, succeeded\)/)
-  assert.match(source, /settleInFlightCardPositions\(workspaceId, positionKeys, false\)/)
+  // The count only tracks sends on the wire; a queued value is protected by its
+  // own pending bucket, so settling can never strand a permanent mark.
+  assert.match(source, /function settleInFlightCardPositions\(workspaceId, positionKeys\)/)
+  assert.doesNotMatch(source, /function settleInFlightCardPositions\(workspaceId, positionKeys, succeeded\)/)
   assert.match(source, /unconfirmedCardPositionKeys\(cardPositionSyncPending, state\.inFlightCardPositionKeys, workspaceId\)/)
   assert.match(source, /mergeCardPositions\(\[\.\.\.state\.cardPositions\], record, unconfirmed\)/)
-  // Failure retries exactly once, then surfaces the error and keeps the marks.
-  assert.match(source, /if \(attempt === 0\) \{[\s\S]{0,160}sendCardPositions\(workspaceId, positions, positionKeys, 1\)/)
+  // Failure re-queues the value (so it stays protected) and retries exactly once.
+  assert.match(source, /if \(attempt \+ 1 < CARD_POSITION_MAX_ATTEMPTS\) \{[\s\S]{0,160}sendCardPositions\(workspaceId, positions, positionKeys, attempt \+ 1\)/)
   assert.match(source, /setError\(`布局保存失败/)
 })
 
@@ -736,7 +760,10 @@ test('deletes the Host node created for an optimistic note that was removed', ()
   assert.match(replace, /wasOptimisticNodeDeleted\(tempId, state\.deletedTempIds\)/)
   assert.match(replace, /deleteHostNode\(created\.id\)/)
   assert.match(source, /state\.deletedTempIds\.add\(nodeId\)/)
-  assert.match(source, /state\.deletedTempIds\.clear\(\)/)
+  // A workspace switch must NOT drop the tombstones: a create POST issued in the
+  // workspace being left can still land afterwards, and losing the tombstone there
+  // would let the reply resurrect the note the user deleted (review K3.1 A5).
+  assert.doesNotMatch(source, /state\.deletedTempIds\.clear\(\)/)
 })
 
 test('never blanks the canvas when the workspace record fails to load', () => {
