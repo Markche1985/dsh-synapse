@@ -23,7 +23,7 @@
   ],
   "scripts": {
     "build": "node --check index.js && node --check client.js && node --check app.js",
-    "prepare": "pnpm run build",
+    "prepare": "node --check index.js && node --check client.js && node --check app.js",
     "test": "node --test test/*.test.js"
   },
   "engines": {
