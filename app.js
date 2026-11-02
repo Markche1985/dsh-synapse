@@ -174,34 +174,41 @@ function settleInFlightCardPositions(workspaceId, positionKeys) {
 const CARD_POSITION_MAX_ATTEMPTS = 2
 
 /**
- * Send one workspace bucket, retrying once. A failed write is put back into the
- * pending bucket: that keeps the local value unconfirmed (no silent rollback by an
- * older Host snapshot) and gives the next flush something to retry. A successful
- * write clears its own queued copy only when the queued value is still the one
- * that was sent — a drag that landed mid-flight must survive.
+ * Send one workspace bucket, retrying inside the loop and settling the in-flight
+ * marks **exactly once** at the end. Going through the marks per attempt (as an
+ * earlier revision did) let a retry retire a mark another request owned, so that
+ * request's value lost its protection while still on the wire.
+ *
+ * A failed attempt re-queues its values, but never over a newer one: anything in
+ * the pending bucket arrived after this flush copied it, so it is strictly newer
+ * and must win.
  */
 async function sendCardPositions(workspaceId, positions, positionKeys, attempt) {
-  try {
-    await api(`/synapse/api/workspaces/${encodeURIComponent(workspaceId)}`, { method: 'PATCH', body: JSON.stringify({ cardPositions: positions }) })
-  } catch (error) {
-    settleInFlightCardPositions(workspaceId, positionKeys)
-    const bucket = cardPositionSyncPending[workspaceId] ?? (cardPositionSyncPending[workspaceId] = {})
-    for (const key of positionKeys) if (positions[key] !== undefined) bucket[key] = positions[key]
-    if (attempt + 1 < CARD_POSITION_MAX_ATTEMPTS) {
-      await sendCardPositions(workspaceId, positions, positionKeys, attempt + 1)
-      return
+  let failure = null
+  for (let tries = attempt; tries < CARD_POSITION_MAX_ATTEMPTS; tries += 1) {
+    try {
+      await api(`/synapse/api/workspaces/${encodeURIComponent(workspaceId)}`, { method: 'PATCH', body: JSON.stringify({ cardPositions: positions }) })
+      failure = null
+      break
+    } catch (error) {
+      failure = error
     }
-    setError(`布局保存失败：${error instanceof Error ? error.message : 'Host 未响应'}`)
-    return
   }
   settleInFlightCardPositions(workspaceId, positionKeys)
+  if (failure !== null) {
+    const bucket = cardPositionSyncPending[workspaceId] ?? (cardPositionSyncPending[workspaceId] = {})
+    for (const key of positionKeys) {
+      if (positions[key] !== undefined && bucket[key] === undefined) bucket[key] = positions[key]
+    }
+    setError(`布局保存失败：${failure instanceof Error ? failure.message : 'Host 未响应'}`)
+    return
+  }
   const bucket = cardPositionSyncPending[workspaceId]
   if (bucket === undefined) return
   for (const key of positionKeys) {
     const queued = bucket[key]
-    if (queued === undefined) continue
     const sent = positions[key]
-    if (sent !== undefined && queued.x === sent.x && queued.y === sent.y) delete bucket[key]
+    if (queued !== undefined && sent !== undefined && queued.x === sent.x && queued.y === sent.y) delete bucket[key]
   }
   if (Object.keys(bucket).length === 0) delete cardPositionSyncPending[workspaceId]
 }
@@ -281,9 +288,11 @@ function applyHostWorkspaceData(workspace) {
     // the workspace being left can still land afterwards, and dropping the
     // tombstone there would let the reply resurrect a note the user deleted.
     // Entries are short-lived — each is removed by its own create callback.
-    state.dirtyNodeIds.clear()
-    nodePatchCounts.clear()
-    nodePatchChains.clear()
+    // `dirtyNodeIds` / `nodePatchCounts` / `nodePatchChains` survive for the same
+    // reason: a PATCH still on the wire settles against its own bookkeeping when it
+    // returns. Clearing them here let that late settle retire a *newer* mark, drop
+    // a still-queued chain, and clear the dirty flag early. Node ids are UUIDs, so
+    // keeping them across a switch cannot leak one workspace's state into another.
     state.canvasTool = 'pan'
   }
   // A failed workspace load must not blank the canvas: only an actual nodes array

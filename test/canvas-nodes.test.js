@@ -431,6 +431,18 @@ test('never leaves an in-flight count behind when a drag lands mid-flight', asyn
   assert.deepEqual(plain(protocol.pending())['ws-a']['t:turn-index:0'], { x: 9, y: 9 })
 })
 
+test('never lets a failed attempt overwrite a newer queued position', async () => {
+  // A drag landed while the first attempt was on the wire. When that attempt
+  // fails it must re-queue only what is missing — the newer value wins, otherwise
+  // the retry would write the older coordinates and roll the card back.
+  const { protocol } = makeProtocol({ failFirst: 2 })
+  protocol.setPending({ 'ws-a': { 't:turn-index:0': { x: 9, y: 9 } } })
+  protocol.markCardPositionsInFlight('ws-a', ['t:turn-index:0'])
+  await protocol.sendCardPositions('ws-a', { 't:turn-index:0': { x: 1, y: 2 } }, ['t:turn-index:0'], 0)
+
+  assert.deepEqual(plain(protocol.pending())['ws-a']['t:turn-index:0'], { x: 9, y: 9 })
+})
+
 test('retires the in-flight mark once the retry succeeds', async () => {
   const { protocol, state, calls, errors } = makeProtocol({ failFirst: 1 })
   protocol.markCardPositionsInFlight('ws-a', ['t:turn-index:0'])
@@ -723,8 +735,13 @@ test('marks position keys in flight and protects them from Host snapshots', () =
   assert.doesNotMatch(source, /function settleInFlightCardPositions\(workspaceId, positionKeys, succeeded\)/)
   assert.match(source, /unconfirmedCardPositionKeys\(cardPositionSyncPending, state\.inFlightCardPositionKeys, workspaceId\)/)
   assert.match(source, /mergeCardPositions\(\[\.\.\.state\.cardPositions\], record, unconfirmed\)/)
-  // Failure re-queues the value (so it stays protected) and retries exactly once.
-  assert.match(source, /if \(attempt \+ 1 < CARD_POSITION_MAX_ATTEMPTS\) \{[\s\S]{0,160}sendCardPositions\(workspaceId, positions, positionKeys, attempt \+ 1\)/)
+  // Retries happen inside one call and settle the marks exactly once afterwards:
+  // a per-attempt settle could retire a mark another request owns.
+  assert.match(source, /for \(let tries = attempt; tries < CARD_POSITION_MAX_ATTEMPTS; tries \+= 1\)/)
+  assert.doesNotMatch(source, /sendCardPositions\(workspaceId, positions, positionKeys, attempt \+ 1\)/)
+  assert.doesNotMatch(source, /catch \(error\) \{\s*settleInFlightCardPositions/)
+  // A failed attempt re-queues only values a newer drag has not replaced.
+  assert.match(source, /bucket\[key\] === undefined\) bucket\[key\] = positions\[key\]/)
   assert.match(source, /setError\(`布局保存失败/)
 })
 
