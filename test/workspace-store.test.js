@@ -29,7 +29,7 @@ test('persists a workspace, a DSH-linked thread, and a message', async () => {
   assert.equal(saved.title, '调研 DSH 插件')
   assert.equal(saved.threads[0].dshSessionId, 'session-1')
   assert.equal(saved.threads[0].messages[0].text, '确定使用已有 Web Server')
-  assert.match(await readFile(dataFile, 'utf8'), /"version": ?5/)
+  assert.match(await readFile(dataFile, 'utf8'), /"version": ?6/)
 })
 
 test('refuses to load an unreadable data file, and never rewrites it', async () => {
@@ -106,7 +106,7 @@ test('projects a batch of session events in a single write', async () => {
   assert.equal(thread.messages[1].process.length, 1)
   assert.equal(thread.messages[1].process[0].status, 'done')
   assert.equal(thread.messages[1].process[0].result, undefined)
-  assert.match(await readFile(join(directory, 'state.json'), 'utf8'), /"version": ?5/)
+  assert.match(await readFile(join(directory, 'state.json'), 'utf8'), /"version": ?6/)
 })
 
 test('retains a tool failure and exposes a failed turn without assistant text', async () => {
@@ -168,7 +168,7 @@ test('migrates v3 tool cards into the assistant process records', async () => {
   assert.equal(thread.messages[1].process[0].result, undefined)
   assert.equal(thread.messages[1].process[1].name, 'bash')
   assert.equal(thread.messages[1].process[1].status, 'pending')
-  assert.match(await readFile(dataFile, 'utf8'), /"version": ?5/)
+  assert.match(await readFile(dataFile, 'utf8'), /"version": ?6/)
 })
 
 test('does not persist the DSH runtime context as a user conversation turn', async () => {
@@ -331,21 +331,23 @@ test('archived canvas nodes stay hidden during a later DSH session sync', async 
   assert.equal((await store.list()).length, 0)
 })
 
-test('does not rewrite an up-to-date v5 file on load', async () => {
+test('does not rewrite an up-to-date v6 file on load', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-idempotent-'))
   const dataFile = join(directory, 'state.json')
   const state = {
-    version: 5,
+    version: 6,
     hiddenSessionIds: [],
     workspaces: [{
       id: 'w-1', kind: 'dsh', cwd: 'C:\\work\\x', title: 'x',
       createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
       threads: [{
         id: 't-1', title: 's', parentId: null, dshSessionId: 's-1', dshSessionTitle: null,
-        color: '#0f766e', position: { x: 86, y: 82 }, sourceSeedLength: null,
+        color: '#0f766e', position: { x: 86, y: 82 }, sourceSeedLength: null, frameId: null,
         createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
         messages: [{ id: 'm-1', kind: 'assistant', text: 'hi', length: 2, truncated: false, sourceSeq: 1, at: '2026-01-01T00:00:00.000Z', process: [] }],
       }],
+      nodes: [],
+      cardPositions: {},
     }],
   }
   await writeFile(dataFile, JSON.stringify(state))
@@ -354,6 +356,151 @@ test('does not rewrite an up-to-date v5 file on load', async () => {
   await new WorkspaceStore(dataFile).ready
   const after = (await stat(dataFile)).mtimeMs
   assert.equal(after, before)
+})
+
+test('migrates a v5 file to v6 by filling the annotation layer', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-v6-migrate-'))
+  const dataFile = join(directory, 'state.json')
+  const at = '2026-01-01T00:00:00.000Z'
+  await writeFile(dataFile, JSON.stringify({
+    version: 5,
+    hiddenSessionIds: [],
+    workspaces: [{
+      id: 'w-1', kind: 'dsh', cwd: 'C:\\work\\v6', title: 'v6', createdAt: at, updatedAt: at,
+      threads: [{
+        id: 't-1', title: 's', parentId: null, dshSessionId: 's-1', dshSessionTitle: null,
+        color: '#0f766e', position: { x: 86, y: 82 }, sourceSeedLength: null,
+        createdAt: at, updatedAt: at, messages: [], pendingProcess: [],
+      }],
+    }],
+  }))
+
+  const store = new WorkspaceStore(dataFile)
+  const graph = await store.get('w-1')
+  assert.deepEqual(graph.nodes, [])
+  assert.deepEqual(graph.cardPositions, {})
+  assert.equal(graph.threads[0].frameId, null)
+  assert.equal(JSON.parse(await readFile(dataFile, 'utf8')).version, 6)
+
+  // The upgrade is a one-time default fill: the v6 file is never rewritten.
+  const before = (await stat(dataFile)).mtimeMs
+  await new Promise(resolve => setTimeout(resolve, 60))
+  await new WorkspaceStore(dataFile).ready
+  assert.equal((await stat(dataFile)).mtimeMs, before)
+})
+
+test('creates, patches and removes canvas nodes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-nodes-'))
+  const store = new WorkspaceStore(join(directory, 'state.json'))
+  const workspace = await store.create('画布')
+
+  const note = await store.createNode(workspace.id, { type: 'note', x: 10, y: 20, text: '第一条便签', color: 'yellow' })
+  assert.equal(note.type, 'note')
+  assert.equal(note.width, 240)
+  assert.equal(note.height, 150)
+  assert.equal(note.z, 1)
+  assert.equal(note.text, '第一条便签')
+
+  const arrow = await store.createNode(workspace.id, { type: 'shape', shape: 'arrow', x1: 0, y1: 0, x2: 200, y2: 80 })
+  assert.equal(arrow.shape, 'arrow')
+  assert.deepEqual([arrow.x1, arrow.y1, arrow.x2, arrow.y2], [0, 0, 200, 80])
+  assert.equal(arrow.strokeWidth, 2)
+
+  const moved = await store.updateNode(note.id, { x: -9999, y: 30, text: 'y'.repeat(4_500) })
+  assert.equal(moved.x, -2000)              // positionOf clamps the world box
+  assert.equal(moved.y, 30)
+  assert.equal(moved.text.length, 4_000)    // MAX_NOTE_LENGTH
+  assert.equal(moved.width, 240)            // untouched fields survive a patch
+
+  await store.removeNode(arrow.id)
+  const graph = await store.get(workspace.id)
+  assert.deepEqual(graph.nodes.map(node => node.id), [note.id])
+})
+
+test('clamps node geometry and rejects invalid node payloads', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-node-guards-'))
+  const store = new WorkspaceStore(join(directory, 'state.json'))
+  const workspace = await store.create('画布')
+
+  const tiny = await store.createNode(workspace.id, { type: 'note', x: 0, y: 0, width: 10, height: 5 })
+  assert.equal(tiny.width, 80)
+  assert.equal(tiny.height, 60)
+
+  await assert.rejects(store.createNode(workspace.id, { type: 'audio', x: 0, y: 0 }), /type 必须是/)
+  await assert.rejects(store.createNode(workspace.id, { type: 'note', x: 'left', y: 0 }), /position 必须包含有效坐标/)
+  await assert.rejects(store.createNode(workspace.id, { type: 'shape', shape: 'star', x: 0, y: 0 }), /shape 必须是/)
+  await assert.rejects(store.createNode(workspace.id, { type: 'image', x: 0, y: 0, image: { attachmentId: 'nope' } }), /attachmentId/)
+  await assert.rejects(store.createNode(workspace.id, { type: 'frame', x: 0, y: 0, memberCards: ['card-id'] }), /memberCards 只接受 positionKey/)
+})
+
+test('groups cards into a frame and releases them when the frame is deleted', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-frames-'))
+  const store = new WorkspaceStore(join(directory, 'state.json'))
+  const workspace = await store.create('画布')
+  const first = await store.createThread(workspace.id, { title: '甲' })
+  const second = await store.createThread(workspace.id, { title: '乙' })
+  const key = `${first.id}:turn-index:0`
+
+  const frame = await store.createNode(workspace.id, { type: 'frame', x: 0, y: 0, title: '分组 1', memberCards: [key] })
+  let graph = await store.get(workspace.id)
+  assert.equal(graph.threads.find(thread => thread.id === first.id).frameId, frame.id)
+  assert.equal(graph.threads.find(thread => thread.id === second.id).frameId, null)
+
+  // Moving the card out of the frame releases its thread again.
+  await store.updateNode(frame.id, { memberCards: [] })
+  graph = await store.get(workspace.id)
+  assert.equal(graph.threads.find(thread => thread.id === first.id).frameId, null)
+
+  await store.updateNode(frame.id, { memberCards: [key], collapsed: true })
+  graph = await store.get(workspace.id)
+  assert.equal(graph.nodes[0].collapsed, true)
+  assert.equal(graph.threads.find(thread => thread.id === first.id).frameId, frame.id)
+
+  await store.removeNode(frame.id)
+  graph = await store.get(workspace.id)
+  assert.equal(graph.threads.find(thread => thread.id === first.id).frameId, null)
+  assert.deepEqual(graph.nodes, [])
+})
+
+test('merges dragged card positions without dropping untouched keys', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-positions-'))
+  const dataFile = join(directory, 'state.json')
+  const store = new WorkspaceStore(dataFile)
+  const workspace = await store.create('画布')
+  const thread = await store.createThread(workspace.id, { title: '甲' })
+  const first = `${thread.id}:turn-index:0`
+  const second = `${thread.id}:turn-index:1`
+
+  await store.mergeCardPositions(workspace.id, { [first]: { x: 120, y: 80 } })
+  const merged = await store.mergeCardPositions(workspace.id, { [second]: { x: -5, y: 9000 } })
+  assert.deepEqual(merged.cardPositions[first], { x: 120, y: 80 })
+  assert.deepEqual(merged.cardPositions[second], { x: -5, y: 5000 })
+
+  await assert.rejects(store.mergeCardPositions(workspace.id, { [first]: { x: 'a', y: 0 } }), /position 必须包含有效坐标/)
+  await assert.rejects(store.mergeCardPositions(workspace.id, []), /cardPositions 必须是对象/)
+
+  const persisted = JSON.parse(await readFile(dataFile, 'utf8'))
+  assert.deepEqual(persisted.workspaces[0].cardPositions[first], { x: 120, y: 80 })
+})
+
+test('stores an image node as an attachment reference, not as bytes', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-synapse-image-node-'))
+  const dataFile = join(directory, 'state.json')
+  const store = new WorkspaceStore(dataFile)
+  const workspace = await store.create('画布')
+  const image = { attachmentId: `sha256:${'a'.repeat(64)}`, mediaType: 'image/png', bytes: 123_456, width: 1600, height: 900 }
+
+  const node = await store.createNode(workspace.id, { type: 'image', x: 40, y: 60, image })
+  assert.deepEqual(node.image, image)
+  assert.equal(node.width, 480)
+  assert.equal(node.height, 270)
+  assert.deepEqual(await store.findImageRef(image.attachmentId), image)
+  assert.equal(await store.findImageRef(`sha256:${'b'.repeat(64)}`), null)
+
+  // The workspace file carries the reference only: no base64 and no byte array.
+  const persisted = await readFile(dataFile, 'utf8')
+  assert.ok(persisted.includes(image.attachmentId))
+  assert.equal(persisted.includes('data:image'), false)
 })
 
 test('coalesces deferred projection saves into one write', async () => {

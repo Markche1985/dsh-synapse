@@ -9,6 +9,30 @@ export const inject = ['webServer', 'sessions']
 const MAX_BODY_BYTES = 32 * 1024
 const MAX_TITLE_LENGTH = 120
 const MAX_NOTE_LENGTH = 4_000
+// Canvas primitives (schema v6) are written one node at a time, so a note, a
+// shape or a frame never approaches the JSON cap above. Images are the one
+// payload that cannot travel as JSON: the bytes live in the DSH attachment
+// store and the node keeps only an immutable `sha256:` reference (~120 B), so
+// workspaces.json stays small (issue #42). The upload route therefore reads the
+// raw request body under its own, much larger, ceiling.
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024
+const MIN_NODE_WIDTH = 80
+const MIN_NODE_HEIGHT = 60
+const MAX_NODE_SIZE = 5_000
+const MAX_FRAME_MEMBERS = 500
+const MAX_CARD_POSITIONS = 1_000
+// SVG is deliberately absent: an uploaded vector would be script-capable on the
+// DSH origin every canvas image is served from.
+const IMAGE_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
+// The DSH attachment store's opaque, content-addressed identity.
+const ATTACHMENT_ID_PATTERN = /^sha256:[a-f0-9]{64}$/
+// A canvas card is named by its position key, never by its card id: the id is
+// ephemeral once DSH assigns a source sequence, the key is stable.
+const POSITION_KEY_PATTERN = /^[0-9a-z-]{8,80}:turn-index:\d{1,6}$/i
+const NODE_TYPES = new Set(['note', 'image', 'shape', 'frame'])
+const SHAPE_KINDS = new Set(['rect', 'ellipse', 'line', 'arrow'])
+// Assigning these as object keys would mutate the prototype of cardPositions.
+const RESERVED_POSITION_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 // Projected message text cap: longer replies truncate with a marker pointing
 // at the detail view instead of silently cutting mid-sentence.
 // Projected messages keep only a short preview: the body already lives in the
@@ -51,6 +75,7 @@ export class WorkspaceStore {
     this.lockWarned = false
     this.dirty = false
     this.flushTimer = null
+    this.writeTicket = 0
   }
 
   async list() {
@@ -62,6 +87,12 @@ export class WorkspaceStore {
     await this.ready
     const workspace = this.workspace(workspaceId)
     return structuredClone(workspace)
+  }
+
+  /** Whether a workspace exists, without cloning it: uploads validate cheaply. */
+  async hasWorkspace(workspaceId) {
+    await this.ready
+    return this.state.workspaces.some(workspace => workspace.id === workspaceId)
   }
 
   /**
@@ -81,7 +112,7 @@ export class WorkspaceStore {
   async create(title) {
     return this.mutate(() => {
       const now = new Date().toISOString()
-      const workspace = { id: randomUUID(), title: requiredText(title, MAX_TITLE_LENGTH, 'title'), createdAt: now, updatedAt: now, threads: [] }
+      const workspace = { id: randomUUID(), title: requiredText(title, MAX_TITLE_LENGTH, 'title'), createdAt: now, updatedAt: now, threads: [], nodes: [], cardPositions: {} }
       this.state.workspaces.unshift(workspace)
       return this.summary(workspace)
     })
@@ -152,9 +183,13 @@ export class WorkspaceStore {
       const removedIds = new Set(removedSessionIds)
       for (const workspace of this.state.workspaces) {
         if (workspace.kind !== 'dsh') continue
-        workspace.threads = workspace.threads.filter(thread => !blankIds.has(thread.dshSessionId) && !removedIds.has(thread.dshSessionId))
+        const removedThreadIds = new Set(workspace.threads
+          .filter(thread => blankIds.has(thread.dshSessionId) || removedIds.has(thread.dshSessionId))
+          .map(thread => thread.id))
+        workspace.threads = workspace.threads.filter(thread => !removedThreadIds.has(thread.id))
+        pruneFrameCards(workspace, removedThreadIds)
       }
-      this.state.workspaces = this.state.workspaces.filter(workspace => workspace.kind !== 'dsh' || workspace.threads.length > 0)
+      this.state.workspaces = this.state.workspaces.filter(workspace => workspace.kind !== 'dsh' || workspace.threads.length > 0 || (workspace.nodes ?? []).length > 0)
       for (const item of sessions) {
         if (typeof item?.id !== 'string' || item.id === '' || typeof item.cwd !== 'string' || item.cwd === '') continue
         if (item.blank === true) continue
@@ -210,10 +245,97 @@ export class WorkspaceStore {
         if (removal.has(item.id) && item.dshSessionId !== null && !this.state.hiddenSessionIds.includes(item.dshSessionId)) this.state.hiddenSessionIds.push(item.dshSessionId)
       }
       workspace.threads = workspace.threads.filter(item => !removal.has(item.id))
+      pruneFrameCards(workspace, removal)
       workspace.updatedAt = new Date().toISOString()
-      if (workspace.threads.length === 0) this.state.workspaces = this.state.workspaces.filter(item => item.id !== workspace.id)
+      if (workspace.threads.length === 0 && (workspace.nodes ?? []).length === 0) this.state.workspaces = this.state.workspaces.filter(item => item.id !== workspace.id)
       return { removed: removal.size }
     })
+  }
+
+  /**
+   * Create one canvas primitive (note, image, shape or frame) beside the
+   * conversation graph. Nodes are written one at a time so a canvas with many
+   * annotations still costs one small JSON write per edit instead of a
+   * whole-canvas save. Image bytes never reach this method: the node carries the
+   * DSH attachment store's immutable reference and nothing else.
+   */
+  async createNode(workspaceId, input) {
+    return this.mutate(() => {
+      const workspace = this.workspace(workspaceId)
+      const now = new Date().toISOString()
+      const node = nodeOf(input, workspace, now)
+      workspace.nodes ??= []
+      workspace.nodes.push(node)
+      if (node.type === 'frame') applyFrameMembers(workspace, node)
+      workspace.updatedAt = now
+      return structuredClone(node)
+    })
+  }
+
+  /** Patch one node in place; only the fields the caller sent are validated. */
+  async updateNode(nodeId, input) {
+    return this.mutate(() => {
+      const { workspace, node } = this.locateNode(nodeId)
+      applyNodePatch(node, input, workspace)
+      workspace.updatedAt = node.updatedAt
+      return structuredClone(node)
+    })
+  }
+
+  /**
+   * Remove one node. A frame releases its threads first — otherwise a deleted
+   * group would leave every card pointing at a frame that no longer exists.
+   */
+  async removeNode(nodeId) {
+    return this.mutate(() => {
+      const { workspace, node } = this.locateNode(nodeId)
+      if (node.type === 'frame') {
+        for (const key of node.memberCards ?? []) {
+          const threadId = positionKeyThreadId(key)
+          const thread = threadId === null ? undefined : workspace.threads.find(item => item.id === threadId)
+          if (thread !== undefined && thread.frameId === node.id) thread.frameId = null
+        }
+      }
+      for (const frame of workspace.nodes ?? []) {
+        if (frame === node || frame.type !== 'frame' || !Array.isArray(frame.memberNodes)) continue
+        frame.memberNodes = frame.memberNodes.filter(item => item !== node.id)
+      }
+      workspace.nodes = (workspace.nodes ?? []).filter(item => item.id !== node.id)
+      workspace.updatedAt = new Date().toISOString()
+      return { removed: 1 }
+    })
+  }
+
+  /** Merge the card positions the browser dragged; keys are position keys. */
+  async mergeCardPositions(workspaceId, positions) {
+    return this.mutate(() => {
+      const workspace = this.workspace(workspaceId)
+      if (positions !== undefined && positions !== null) {
+        if (typeof positions !== 'object' || Array.isArray(positions)) throw new InputError('cardPositions 必须是对象')
+        const entries = Object.entries(positions)
+        if (entries.length > MAX_CARD_POSITIONS) throw new InputError('cardPositions 数量过多')
+        workspace.cardPositions ??= {}
+        for (const [key, value] of entries) workspace.cardPositions[positionKeyOf(key, false)] = positionOf(value)
+      }
+      workspace.updatedAt = new Date().toISOString()
+      return structuredClone(workspace)
+    })
+  }
+
+  /**
+   * The durable reference of an image some node in this canvas still uses.
+   * Serving only referenced attachments keeps the asset route from becoming a
+   * reader for every image in the harness home.
+   */
+  async findImageRef(attachmentId) {
+    await this.ready
+    if (typeof attachmentId !== 'string' || !ATTACHMENT_ID_PATTERN.test(attachmentId)) return null
+    for (const workspace of this.state.workspaces) {
+      for (const node of workspace.nodes ?? []) {
+        if (node.type === 'image' && node.image?.attachmentId === attachmentId) return { ...node.image }
+      }
+    }
+    return null
   }
 
   async clearLegacy(sessions) {
@@ -290,7 +412,7 @@ export class WorkspaceStore {
         // file to repair.
         throw new Error(`synapse: cannot read ${this.dataFile}: ${error.message}`)
       }
-      this.state = { version: 5, hiddenSessionIds: [], workspaces: [] }
+      this.state = { version: 6, hiddenSessionIds: [], workspaces: [] }
       await this.save()
     }
   }
@@ -341,9 +463,13 @@ export class WorkspaceStore {
     }
     await this.acquireLock()
     try {
-      const temporaryFile = `${this.dataFile}.${process.pid}.tmp`
+      // The ticket keeps two writes inside ONE process (a v6 migration on load
+      // racing the first mutation, or two stores over one file in a test) from
+      // sharing a temp path: `rename` would then find the file already moved and
+      // fail with EPERM/ENOENT. The pid alone was not unique enough.
+      const temporaryFile = `${this.dataFile}.${process.pid}.${++this.writeTicket}.tmp`
       await writeFile(temporaryFile, `${JSON.stringify(this.state)}\n`, 'utf8')
-      await rename(temporaryFile, this.dataFile)
+      await renameWithRetry(temporaryFile, this.dataFile)
       this.lastKnownMtime = (await stat(this.dataFile)).mtimeMs
     } finally {
       await this.releaseLock()
@@ -414,11 +540,19 @@ export class WorkspaceStore {
     throw new NotFoundError('节点不存在')
   }
 
+  locateNode(nodeId) {
+    for (const workspace of this.state.workspaces) {
+      const node = (workspace.nodes ?? []).find(item => item.id === nodeId)
+      if (node !== undefined) return { workspace, node }
+    }
+    throw new NotFoundError('画布元素不存在')
+  }
+
   dshWorkspace(cwd, fallbackTitle) {
     let workspace = this.state.workspaces.find(item => item.kind === 'dsh' && item.cwd === cwd)
     if (workspace !== undefined) return workspace
     const now = new Date().toISOString()
-    workspace = { id: randomUUID(), kind: 'dsh', cwd, title: workspaceTitle(cwd, fallbackTitle), createdAt: now, updatedAt: now, threads: [] }
+    workspace = { id: randomUUID(), kind: 'dsh', cwd, title: workspaceTitle(cwd, fallbackTitle), createdAt: now, updatedAt: now, threads: [], nodes: [], cardPositions: {} }
     this.state.workspaces.unshift(workspace)
     return workspace
   }
@@ -450,6 +584,9 @@ export class WorkspaceStore {
       dshSessionId: session.id,
       dshSessionTitle: typeof session.title === 'string' ? session.title.slice(0, MAX_TITLE_LENGTH) : null,
       color: TOPIC_COLORS[workspace.threads.length % TOPIC_COLORS.length],
+      // The group frame this thread's cards belong to, when the canvas put them
+      // in one. Layout is a canvas concern; the projection never guesses it.
+      frameId: null,
       // DSH projection stores only a neutral semantic anchor. The visual map
       // lays out visible cards from the current conversation graph each render,
       // so old/archived session counts must never leak into future coordinates.
@@ -559,6 +696,7 @@ export class WorkspaceStore {
       dshSessionId: typeof dshSessionId === 'string' && dshSessionId.length > 0 ? dshSessionId : null,
       dshSessionTitle: typeof dshSessionTitle === 'string' ? dshSessionTitle.slice(0, MAX_TITLE_LENGTH) : null,
       color: TOPIC_COLORS.includes(color) ? color : TOPIC_COLORS[order % TOPIC_COLORS.length],
+      frameId: null,
       position: positionOf(position ?? { x: 86 + (order % 3) * 410, y: 82 + Math.floor(order / 3) * 260 }),
       createdAt: now,
       updatedAt: now,
@@ -572,13 +710,61 @@ export class WorkspaceStore {
   }
 }
 
+/**
+ * Replace a file, tolerating the transient Windows refusals. An antivirus
+ * scanner or another reader holding the destination open makes `rename` fail
+ * with EPERM/EBUSY/EACCES for a few milliseconds; retrying beats losing the
+ * write. A locked source (ENOENT after a competing move) is not retried — that
+ * is a real bug, not a race with the OS.
+ */
+async function renameWithRetry(from, to, attempts = 4) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await rename(from, to)
+    } catch (error) {
+      const transient = error?.code === 'EPERM' || error?.code === 'EBUSY' || error?.code === 'EACCES'
+      if (!transient || attempt >= attempts) throw error
+      await new Promise(resolve => setTimeout(resolve, 10 * attempt))
+    }
+  }
+}
+
 class InputError extends Error {}
 class NotFoundError extends Error {}
+class PayloadTooLargeError extends Error {}
+class UnsupportedMediaError extends Error {}
+class UnavailableError extends Error {}
+
+// The DSH attachment store raises a structurally-compatible `AttachmentError`
+// carrying a stable code (never a prototype we can rely on across packages).
+// Only the codes a canvas user can act on get their own status and wording.
+const ATTACHMENT_FAILURES = new Map([
+  ['IMAGE_TOO_LARGE', [413, '图片超过体积上限']],
+  ['IMAGES_TOO_LARGE', [413, '图片超过体积上限']],
+  ['IMAGE_TOO_MANY_PIXELS', [413, '图片像素过多']],
+  ['IMAGE_DIMENSION_TOO_LARGE', [413, '图片边长过大']],
+  ['TOO_MANY_IMAGES', [413, '图片数量过多']],
+  ['UNSUPPORTED_IMAGE_TYPE', [415, '不支持的图片格式']],
+  ['IMAGE_TYPE_MISMATCH', [415, '图片内容与声明的类型不一致']],
+  ['INVALID_IMAGE', [400, '图片内容无法识别']],
+  ['INVALID_IMAGE_BASE64', [400, '图片编码无效']],
+  ['INVALID_FILE_BASE64', [400, '文件编码无效']],
+  ['INVALID_ATTACHMENT_REF', [400, '图片引用无效']],
+  ['ATTACHMENT_NOT_FOUND', [404, '图片不存在']],
+])
+
+function isAttachmentFailure(error) {
+  return error instanceof Error && error.name === 'AttachmentError' && typeof error.code === 'string'
+}
+
+function attachmentFailure(error) {
+  return ATTACHMENT_FAILURES.get(error.code) ?? [500, '图片读写失败']
+}
 
 function normalizeState(value) {
   let migrated = false
   let state
-  if ((value?.version === 2 || value?.version === 3 || value?.version === 4 || value?.version === 5) && Array.isArray(value.workspaces)) {
+  if ((value?.version === 2 || value?.version === 3 || value?.version === 4 || value?.version === 5 || value?.version === 6) && Array.isArray(value.workspaces)) {
     const hiddenSessionIds = Array.isArray(value.hiddenSessionIds) ? value.hiddenSessionIds.filter(item => typeof item === 'string') : []
     migrated = value.version < 3 || !Array.isArray(value.hiddenSessionIds)
     const workspaces = value.workspaces.map(workspace => ({
@@ -619,7 +805,7 @@ function normalizeState(value) {
     }
     migrated = true
   } else {
-    throw new Error('expected Synapse data version 1, 2, 3, 4, or 5')
+    throw new Error('expected Synapse data version 1, 2, 3, 4, 5, or 6')
   }
   if (state.version < 4) {
     if (foldLegacyToolCards(state.workspaces)) migrated = true
@@ -636,6 +822,22 @@ function normalizeState(value) {
       }
     }
     state.version = 5
+    migrated = true
+  }
+  // v6 adds the canvas annotation layer beside the conversation graph: notes,
+  // images, shapes and group frames live on the workspace, and a card names the
+  // frame that holds it. Nothing is rewritten — an absent collection is empty
+  // and absent membership is null — so this step is a default-fill, not a
+  // conversion, and a v6 file is never touched on load.
+  if (state.version < 6) {
+    for (const workspace of state.workspaces) {
+      if (!Array.isArray(workspace.nodes)) workspace.nodes = []
+      if (workspace.cardPositions === null || typeof workspace.cardPositions !== 'object' || Array.isArray(workspace.cardPositions)) workspace.cardPositions = {}
+      for (const thread of workspace.threads ?? []) {
+        if (typeof thread.frameId !== 'string') thread.frameId = null
+      }
+    }
+    state.version = 6
     migrated = true
   }
   return { state, migrated }
@@ -731,6 +933,265 @@ function requiredText(value, maxLength, field) {
   if (text.length === 0) throw new InputError(`${field} 不能为空`)
   if (text.length > maxLength) throw new InputError(`${field} 超过长度限制`)
   return text
+}
+
+// ---------------------------------------------------------------------------
+// Canvas primitives (schema v6)
+//
+// A node is one annotation drawn beside the conversation graph: a sticky note,
+// a pasted image, a shape/arrow, or a group frame. Every node is validated
+// before it enters the state, because the browser receives these objects back
+// verbatim and renders them as geometry.
+// ---------------------------------------------------------------------------
+
+/** Build one validated node. `input` comes straight from JSON, so nothing is trusted. */
+function nodeOf(input, workspace, now) {
+  const type = requiredNodeType(input?.type)
+  const base = { id: randomUUID(), type, z: zOf(input?.z, workspace), createdAt: now, updatedAt: now }
+  if (type === 'note') {
+    const position = positionOf(input)
+    const size = nodeSizeOf(input, { width: 240, height: 150 })
+    return {
+      ...base,
+      x: position.x, y: position.y, width: size.width, height: size.height,
+      text: nodeTextOf(input?.text),
+      color: nodeColorOf(input?.color, 'yellow'),
+    }
+  }
+  if (type === 'image') {
+    const image = imageRefOf(input?.image)
+    const position = positionOf(input)
+    const size = nodeSizeOf(input, defaultImageSize(image))
+    return { ...base, x: position.x, y: position.y, width: size.width, height: size.height, image }
+  }
+  if (type === 'shape') {
+    const shape = shapeOf(input?.shape)
+    const stroke = { stroke: strokeColorOf(input?.stroke), strokeWidth: strokeWidthOf(input?.strokeWidth) }
+    if (shape === 'rect' || shape === 'ellipse') {
+      const position = positionOf(input)
+      const size = nodeSizeOf(input, { width: 180, height: 120 })
+      return { ...base, shape, x: position.x, y: position.y, width: size.width, height: size.height, ...stroke, fill: fillOf(input?.fill) }
+    }
+    const start = positionOf({ x: input?.x1, y: input?.y1 })
+    const end = positionOf({ x: input?.x2, y: input?.y2 })
+    return { ...base, shape, x1: start.x, y1: start.y, x2: end.x, y2: end.y, ...stroke }
+  }
+  const position = positionOf(input)
+  const size = nodeSizeOf(input, { width: 420, height: 300 })
+  return {
+    ...base,
+    x: position.x, y: position.y, width: size.width, height: size.height,
+    title: nodeTitleOf(input?.title),
+    collapsed: input?.collapsed === true,
+    memberCards: memberCardsOf(input?.memberCards) ?? [],
+    memberNodes: memberNodesOf(input?.memberNodes, workspace) ?? [],
+  }
+}
+
+/** Apply the fields one PATCH actually carried, leaving the rest untouched. */
+function applyNodePatch(node, input, workspace) {
+  const patch = input !== null && typeof input === 'object' ? input : {}
+  const boxed = node.type !== 'shape' || node.shape === 'rect' || node.shape === 'ellipse'
+  if (boxed && (patch.x !== undefined || patch.y !== undefined)) {
+    const position = positionOf({ x: patch.x ?? node.x, y: patch.y ?? node.y })
+    node.x = position.x
+    node.y = position.y
+  }
+  if (boxed && (patch.width !== undefined || patch.height !== undefined)) {
+    const size = sizeOf({ width: patch.width ?? node.width, height: patch.height ?? node.height })
+    node.width = size.width
+    node.height = size.height
+  }
+  if (!boxed && (patch.x1 !== undefined || patch.y1 !== undefined)) {
+    const start = positionOf({ x: patch.x1 ?? node.x1, y: patch.y1 ?? node.y1 })
+    node.x1 = start.x
+    node.y1 = start.y
+  }
+  if (!boxed && (patch.x2 !== undefined || patch.y2 !== undefined)) {
+    const end = positionOf({ x: patch.x2 ?? node.x2, y: patch.y2 ?? node.y2 })
+    node.x2 = end.x
+    node.y2 = end.y
+  }
+  if (patch.z !== undefined) node.z = zOf(patch.z, workspace)
+  if (patch.text !== undefined) node.text = nodeTextOf(patch.text)
+  if (patch.title !== undefined) node.title = nodeTitleOf(patch.title)
+  if (patch.collapsed !== undefined) node.collapsed = patch.collapsed === true
+  if (patch.color !== undefined) node.color = nodeColorOf(patch.color, node.color ?? 'yellow')
+  if (patch.stroke !== undefined) node.stroke = strokeColorOf(patch.stroke)
+  if (patch.strokeWidth !== undefined) node.strokeWidth = strokeWidthOf(patch.strokeWidth)
+  if (patch.fill !== undefined) node.fill = fillOf(patch.fill)
+  if (node.type === 'frame' && (patch.memberCards !== undefined || patch.memberNodes !== undefined)) {
+    if (patch.memberCards !== undefined) node.memberCards = memberCardsOf(patch.memberCards) ?? []
+    if (patch.memberNodes !== undefined) node.memberNodes = memberNodesOf(patch.memberNodes, workspace) ?? []
+    applyFrameMembers(workspace, node)
+  }
+  node.updatedAt = new Date().toISOString()
+}
+
+/**
+ * Point every member thread at this frame and release threads it no longer
+ * holds, so `thread.frameId` never outlives its frame's membership list.
+ */
+function applyFrameMembers(workspace, frame) {
+  const memberThreadIds = new Set()
+  for (const key of frame.memberCards ?? []) {
+    const threadId = positionKeyThreadId(key)
+    if (threadId !== null) memberThreadIds.add(threadId)
+  }
+  for (const thread of workspace.threads ?? []) {
+    if (memberThreadIds.has(thread.id)) thread.frameId = frame.id
+    else if (thread.frameId === frame.id) thread.frameId = null
+  }
+}
+
+/** `${threadId}:turn-index:${turnIndex}` → threadId, or null for another shape. */
+function positionKeyThreadId(value) {
+  if (typeof value !== 'string') return null
+  const index = value.lastIndexOf(':turn-index:')
+  return index > 0 ? value.slice(0, index) : null
+}
+
+/** Drop the position keys of removed threads from every frame in the workspace. */
+function pruneFrameCards(workspace, removedThreadIds) {
+  if (removedThreadIds.size === 0) return
+  for (const node of workspace.nodes ?? []) {
+    if (node.type !== 'frame' || !Array.isArray(node.memberCards)) continue
+    const kept = node.memberCards.filter(key => !removedThreadIds.has(positionKeyThreadId(key)))
+    if (kept.length !== node.memberCards.length) node.memberCards = kept
+  }
+}
+
+/**
+ * Validate one card key. `strict` demands the contract's position key; the
+ * looser form accepts any stable key so an older browser that still stores card
+ * ids cannot lose its whole position batch to a 400.
+ */
+function positionKeyOf(value, strict) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 200) throw new InputError('positionKey 无效')
+  if (RESERVED_POSITION_KEYS.has(value) || !/^[0-9a-zA-Z:._-]+$/.test(value)) throw new InputError('positionKey 无效')
+  if (strict === true && !POSITION_KEY_PATTERN.test(value)) throw new InputError('memberCards 只接受 positionKey')
+  return value
+}
+
+function requiredNodeType(value) {
+  if (typeof value !== 'string' || !NODE_TYPES.has(value)) throw new InputError('type 必须是 note、image、shape 或 frame')
+  return value
+}
+
+function shapeOf(value) {
+  if (typeof value !== 'string' || !SHAPE_KINDS.has(value)) throw new InputError('shape 必须是 rect、ellipse、line 或 arrow')
+  return value
+}
+
+/** Clamped box size; a node is never smaller than what its handles need. */
+function sizeOf(value) {
+  const width = Number(value?.width)
+  const height = Number(value?.height)
+  if (!Number.isFinite(width) || !Number.isFinite(height)) throw new InputError('尺寸必须包含有效宽高')
+  return {
+    width: Math.round(Math.min(MAX_NODE_SIZE, Math.max(MIN_NODE_WIDTH, width))),
+    height: Math.round(Math.min(MAX_NODE_SIZE, Math.max(MIN_NODE_HEIGHT, height))),
+  }
+}
+
+function nodeSizeOf(input, fallback) {
+  if (input?.width === undefined && input?.height === undefined) return { ...fallback }
+  return sizeOf({ width: input?.width ?? fallback.width, height: input?.height ?? fallback.height })
+}
+
+function zOf(value, workspace) {
+  if (value !== undefined && value !== null) {
+    const z = Number(value)
+    if (!Number.isFinite(z)) throw new InputError('z 必须是数字')
+    return Math.round(Math.min(10_000, Math.max(-10_000, z)))
+  }
+  return (workspace?.nodes ?? []).reduce((max, node) => (Number.isFinite(node?.z) ? Math.max(max, node.z) : max), 0) + 1
+}
+
+function nodeTextOf(value) {
+  if (value === undefined || value === null) return ''
+  if (typeof value !== 'string') throw new InputError('text 必须是文本')
+  return value.slice(0, MAX_NOTE_LENGTH)
+}
+
+function nodeTitleOf(value) {
+  if (value === undefined || value === null) return '分组'
+  if (typeof value !== 'string') throw new InputError('title 必须是文本')
+  const title = value.trim()
+  return (title === '' ? '分组' : title).slice(0, MAX_TITLE_LENGTH)
+}
+
+function nodeColorOf(value, fallback) {
+  if (value === undefined || value === null) return fallback
+  if (typeof value !== 'string' || !/^[a-z][a-z-]{0,23}$/.test(value)) throw new InputError('color 无效')
+  return value
+}
+
+function strokeColorOf(value) {
+  if (value === undefined || value === null) return '#3d4d63'
+  if (typeof value !== 'string' || !/^#[0-9a-f]{3,8}$/i.test(value)) throw new InputError('stroke 必须是颜色值')
+  return value.toLowerCase()
+}
+
+function strokeWidthOf(value) {
+  if (value === undefined || value === null) return 2
+  const width = Number(value)
+  if (!Number.isFinite(width)) throw new InputError('strokeWidth 必须是数字')
+  return Math.round(Math.min(12, Math.max(1, width)))
+}
+
+function fillOf(value) {
+  if (value === undefined || value === null) return 'none'
+  if (typeof value !== 'string') throw new InputError('fill 必须是颜色值')
+  const fill = value.toLowerCase()
+  if (fill !== 'none' && !/^#[0-9a-f]{3,8}$/.test(fill)) throw new InputError('fill 必须是颜色值')
+  return fill
+}
+
+/** The only shape an image reference may take: the attachment store's receipt. */
+function imageRefOf(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new InputError('image 必须是附件引用')
+  const attachmentId = typeof value.attachmentId === 'string' ? value.attachmentId.toLowerCase() : ''
+  if (!ATTACHMENT_ID_PATTERN.test(attachmentId)) throw new InputError('image.attachmentId 无效')
+  const mediaType = typeof value.mediaType === 'string' ? value.mediaType.toLowerCase() : ''
+  if (!IMAGE_MEDIA_TYPES.has(mediaType)) throw new InputError('image.mediaType 不受支持')
+  const bytes = Number(value.bytes)
+  const width = Number(value.width)
+  const height = Number(value.height)
+  if (!Number.isSafeInteger(bytes) || bytes <= 0) throw new InputError('image.bytes 无效')
+  if (!Number.isSafeInteger(width) || width <= 0 || !Number.isSafeInteger(height) || height <= 0) throw new InputError('image 尺寸无效')
+  return { attachmentId, mediaType, bytes, width, height }
+}
+
+/** Default card size for a pasted image: preserve the aspect ratio. */
+function defaultImageSize(image) {
+  const width = Math.min(480, Math.max(MIN_NODE_WIDTH, image.width))
+  return { width, height: Math.max(MIN_NODE_HEIGHT, Math.round(width * image.height / image.width)) }
+}
+
+function memberCardsOf(value) {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) throw new InputError('memberCards 必须是数组')
+  if (value.length > MAX_FRAME_MEMBERS) throw new InputError('分组内的卡片过多')
+  const keys = []
+  for (const item of value) {
+    const key = positionKeyOf(item, true)
+    if (!keys.includes(key)) keys.push(key)
+  }
+  return keys
+}
+
+function memberNodesOf(value, workspace) {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) throw new InputError('memberNodes 必须是数组')
+  if (value.length > MAX_FRAME_MEMBERS) throw new InputError('分组内的元素过多')
+  const ids = []
+  for (const item of value) {
+    if (typeof item !== 'string' || item.length === 0 || item.length > 200) throw new InputError('memberNodes 只接受节点 id')
+    if (!(workspace.nodes ?? []).some(node => node.id === item)) throw new InputError('分组引用的画布元素不存在')
+    if (!ids.includes(item)) ids.push(item)
+  }
+  return ids
 }
 
 /** Event → canvas message kind, or null when the event is not a message. */
@@ -1003,6 +1464,26 @@ async function readJson(req) {
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { throw new InputError('请求不是有效 JSON') }
 }
 
+/**
+ * Read one raw binary body under its own ceiling. `readJson`'s 32 KiB cap
+ * exists because every JSON route answers from a small state object; an image
+ * upload is the one request whose body is the payload, so it gets its own
+ * budget and a declared-length pre-check that refuses before the bytes arrive.
+ */
+async function readBody(req, maxBytes) {
+  const declared = Number.parseInt(typeof req.headers?.['content-length'] === 'string' ? req.headers['content-length'] : '', 10)
+  if (Number.isInteger(declared) && declared > maxBytes) throw new PayloadTooLargeError(`请求内容过大（上限 ${Math.round(maxBytes / 1024 / 1024)} MiB）`)
+  const chunks = []
+  let length = 0
+  for await (const chunk of req) {
+    length += chunk.length
+    if (length > maxBytes) throw new PayloadTooLargeError(`请求内容过大（上限 ${Math.round(maxBytes / 1024 / 1024)} MiB）`)
+    chunks.push(chunk)
+  }
+  if (length === 0) throw new InputError('图片内容为空')
+  return Buffer.concat(chunks)
+}
+
 function sendJson(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
   res.end(JSON.stringify(body))
@@ -1011,6 +1492,31 @@ function sendJson(res, status, body) {
 function sendFile(res, contentType, body) {
   res.writeHead(200, { 'content-type': contentType, 'cache-control': 'no-store' })
   res.end(body)
+}
+
+/**
+ * Serve one attachment object. The URL is content-addressed, so the bytes behind
+ * it can never change: the response is immutable, and `nosniff` keeps a stored
+ * object from being reinterpreted as something scriptable.
+ */
+function sendImage(res, contentType, body) {
+  res.writeHead(200, {
+    'content-type': contentType,
+    'content-length': body.length,
+    // `private`: a canvas image belongs to this user's browser. The bytes are
+    // content-addressed so they never change, but a shared proxy on a LAN-trusted
+    // host must not keep a copy.
+    'cache-control': 'private, max-age=31536000, immutable',
+    'x-content-type-options': 'nosniff',
+  })
+  res.end(body)
+}
+
+/** The request's media type, or a 415 when this deployment will not store it. */
+function imageMediaTypeOf(value) {
+  const mediaType = (typeof value === 'string' ? value : '').split(';', 1)[0].trim().toLowerCase()
+  if (!IMAGE_MEDIA_TYPES.has(mediaType)) throw new UnsupportedMediaError('只支持 png/jpeg/webp/gif 图片')
+  return mediaType
 }
 
 function page() {
@@ -1091,6 +1597,42 @@ export function apply(ctx, config) {
     if (events === null) return { messages: {}, unavailable: true }
     return { messages: bodiesFromEvents(thread, events, seqs) }
   }
+  // The DSH attachment store is an optional capability: the shipped base
+  // composition mounts `dsh-attachment-local`, but a custom composition may not.
+  // Every canvas feature except images works without it, so the service is read
+  // lazily — Cordis throws on a bare `ctx.attachments` access when the service
+  // was never injected, and `ctx.get()` is its documented read-without-inject
+  // accessor. Its absence surfaces as a 503 on the two image routes only.
+  const attachmentStore = () => {
+    if (typeof ctx.get === 'function') return ctx.get('attachments')
+    try { return ctx.attachments } catch { return undefined }
+  }
+  const saveImageAttachment = async (data, mediaType) => {
+    const attachments = attachmentStore()
+    if (attachments === undefined) throw new UnavailableError('DSH 附件库不可用，暂时无法保存图片')
+    const input = { data, mediaType }
+    if (typeof attachments.saveImage === 'function') return attachments.saveImage(input)
+    if (typeof attachments.saveImages === 'function') {
+      const [ref] = await attachments.saveImages([input])
+      return ref
+    }
+    throw new UnavailableError('DSH 附件库不可用，暂时无法保存图片')
+  }
+  const readImageAttachment = async ref => {
+    const attachments = attachmentStore()
+    if (attachments === undefined) throw new UnavailableError('DSH 附件库不可用，暂时无法读取图片')
+    if (typeof attachments.readImage === 'function') {
+      const stored = await attachments.readImage(ref)
+      if (stored !== null && typeof stored === 'object' && stored.data !== undefined) return { mediaType: stored.ref?.mediaType ?? ref.mediaType, data: stored.data }
+    }
+    // A backend without normalized-image reads can still hand over the
+    // host-file location of the immutable object it stored.
+    if (typeof attachments.imageHostPath === 'function') {
+      const path = attachments.imageHostPath(ref)
+      if (typeof path === 'string' && path !== '') return { mediaType: ref.mediaType, data: await readFile(path) }
+    }
+    throw new UnavailableError('DSH 附件库不可用，暂时无法读取图片')
+  }
   // The DSH /api browser-trust fence does not cover /synapse routes, so this
   // handler checks the Host header itself: localhost is allowed by default and
   // additional authorities opt in through config.trustedHosts (mirrors the
@@ -1110,6 +1652,37 @@ export function apply(ctx, config) {
       if (workspace !== null) {
         if (req.method === 'GET') return sendJson(res, 200, { workspace: await store.get(workspace[1]) })
         if (req.method === 'POST') return sendJson(res, 201, { thread: await store.createThread(workspace[1], await readJson(req)) })
+        // Card positions are merged, never replaced: the browser sends only the
+        // keys it just moved, so a second tab's drags survive.
+        if (req.method === 'PATCH') return sendJson(res, 200, { workspace: await store.mergeCardPositions(workspace[1], (await readJson(req)).cardPositions) })
+      }
+      const workspaceNodes = /^\/synapse\/api\/workspaces\/([0-9a-f-]+)\/nodes$/i.exec(path)
+      if (workspaceNodes !== null && req.method === 'POST') return sendJson(res, 201, { node: await store.createNode(workspaceNodes[1], await readJson(req)) })
+      const workspaceImages = /^\/synapse\/api\/workspaces\/([0-9a-f-]+)\/images$/i.exec(path)
+      if (workspaceImages !== null && req.method === 'POST') {
+        // The body is the image itself, so the media type is the only type
+        // information that exists and the bytes are capped by MAX_IMAGE_BYTES
+        // instead of the JSON route's 32 KiB. The workspace is resolved first so
+        // a typo cannot leave an unreferenced object behind, and the reply is the
+        // attachment receipt — the caller creates the node with it, which keeps
+        // placement in the same request as every other node.
+        if (!await store.hasWorkspace(workspaceImages[1])) throw new NotFoundError('工作空间不存在')
+        const mediaType = imageMediaTypeOf(req.headers['content-type'])
+        const data = await readBody(req, MAX_IMAGE_BYTES)
+        return sendJson(res, 201, { image: await saveImageAttachment(data, mediaType) })
+      }
+      const nodeRoute = /^\/synapse\/api\/nodes\/([0-9a-f-]+)$/i.exec(path)
+      if (nodeRoute !== null && req.method === 'PATCH') return sendJson(res, 200, { node: await store.updateNode(nodeRoute[1], await readJson(req)) })
+      if (nodeRoute !== null && req.method === 'DELETE') return sendJson(res, 200, await store.removeNode(nodeRoute[1]))
+      // Content-addressed image bytes. Only an attachment some node in this
+      // canvas still references is served, so the route cannot read the whole
+      // harness attachment store.
+      const asset = /^\/synapse\/api\/assets\/(sha256:[0-9a-f]{64})$/i.exec(path)
+      if (asset !== null && req.method === 'GET') {
+        const ref = await store.findImageRef(asset[1].toLowerCase())
+        if (ref === null) throw new NotFoundError('图片不存在')
+        const stored = await readImageAttachment(ref)
+        return sendImage(res, stored.mediaType, stored.data)
       }
       const branch = /^\/synapse\/api\/threads\/([0-9a-f-]+)\/branch$/i.exec(path)
       if (branch !== null && req.method === 'POST') return sendJson(res, 201, { thread: await store.branch(branch[1], await readJson(req)) })
@@ -1131,6 +1704,15 @@ export function apply(ctx, config) {
     } catch (error) {
       if (error instanceof InputError) return sendJson(res, 400, { error: error.message })
       if (error instanceof NotFoundError) return sendJson(res, 404, { error: error.message })
+      if (error instanceof PayloadTooLargeError) return sendJson(res, 413, { error: error.message })
+      if (error instanceof UnsupportedMediaError) return sendJson(res, 415, { error: error.message })
+      if (error instanceof UnavailableError) return sendJson(res, 503, { error: error.message })
+      if (isAttachmentFailure(error)) {
+        const [status, message] = attachmentFailure(error)
+        if (status < 500) return sendJson(res, status, { error: message })
+        ctx.logger.error(error)
+        return sendJson(res, status, { error: message })
+      }
       ctx.logger.error(error instanceof Error ? error : new Error(String(error)))
       // A store that cannot read its file carries the only actionable detail —
       // the path. Passing it through beats a generic banner the user cannot act

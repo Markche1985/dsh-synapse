@@ -103,11 +103,29 @@ Open the top **Session Map** switch after startup. Do not run two `dsh web` proc
 The canvas supports:
 
 - Panning and zooming up to 4×.
-- Dragging cards with persisted positions.
+- Dragging cards with positions persisted on the host (they survive a restart and a different browser).
 - Expanding or collapsing descendant conversation subtrees.
 - One-click focus on the current session.
 - Smooth card scrolling and Markdown table rendering.
 - Folding tool calls and results into the related assistant answer by `callId`.
+
+### Annotations
+
+The toolbar at the top of the canvas adds annotations next to the conversation cards. Annotations are saved with the canvas.
+
+| Tool | How it works |
+|---|---|
+| **Note** | Press **Note** (or `N`), then click an empty spot. Click the body to edit; clicking away saves it. `Esc` leaves the editor, the bottom-right corner resizes it, `×` deletes it. |
+| **Image** | Paste a screenshot with `Ctrl+V`, drop an image file onto the canvas, or press **Image** to pick a file. The browser downsizes it to a 1600px long edge and re-encodes to WebP before uploading. |
+| **Arrow / rectangle / ellipse** | Pick a tool and drag on the canvas; a plain click gets a default-sized shape. An arrow's two end handles can be dragged afterwards. |
+| **Marquee / group** | Press **Select** and drag a rubber band over empty canvas (or `Shift`/`Ctrl`-click cards and annotations), then press **Group** or `G`. |
+
+How groups behave:
+
+- Drag the **header bar** to move the whole group — its cards and annotations move with it.
+- Drag a **card inside the group** and only that card moves; it leaves the group automatically.
+- The header buttons collapse the group into **one summary row** (with its member count) and expand it again. Switching to a conversation whose cards are collapsed expands that group first, so focus never lands on a hidden card.
+- `Delete` / `Backspace` removes the selected annotations; `Esc` cancels the active tool and the selection.
 
 The **Dialogue / Session Map** switch can be moved too:
 
@@ -117,6 +135,13 @@ The **Dialogue / Session Map** switch can be moved too:
 - It always keeps an 8px grab margin from the viewport edges, so shrinking the window cannot strand it off screen.
 
 ## Recent changes
+
+**0.6.0**
+
+- New annotation layer: sticky notes, pasted images, arrows / rectangles / ellipses, and collapsible group frames (new).
+- Card positions are now stored in the host's `workspaces.json`. The desktop app opens the page on a random port every launch (`--port 0`) and browser storage is origin-scoped, so **positions used to be lost on every restart**; they now survive a restart and a different browser.
+- Pasted images live in the DSH attachment store (`$DSH_HOME/attachments/`); a canvas node keeps only a content-addressed reference, so `workspaces.json` does not grow with images.
+- Fixed a rendering hazard: a status message appearing no longer rebuilds the whole canvas subtree.
 
 **0.5.6**
 
@@ -172,8 +197,9 @@ A leftover `allowBuilds` key in `pnpm-workspace.yaml` is harmless and may also b
 ## Data and runtime boundaries
 
 - DSH session logs own the actual conversation content.
-- Synapse `workspaces.json` stores only canvas metadata, layout, and branch anchors.
-- Deleting `workspaces.json` loses canvas layout, never DSH sessions.
+- Synapse `workspaces.json` stores only canvas metadata, layout, card positions, annotation nodes (note text, shapes, groups) and branch anchors; the format is **version 6**, and older versions migrate on load.
+- Pasted images are not stored in `workspaces.json`: the bytes go to the DSH attachment store (`$DSH_HOME/attachments/`) and the node keeps a content-addressed reference (~120 bytes), so adding images never bloats the metadata file.
+- Deleting `workspaces.json` loses canvas layout and annotations, never DSH sessions — and never the images in the attachment store.
 - Projected message text is capped at 8000 characters; longer card text ends with “—…（详情查看全文）”, while the full content remains available in conversation details.
 - The plugin starts no second Web server and creates no second agent system.
 
@@ -192,6 +218,9 @@ Does not invalidate. The plugin never changes request headers, system prompts, o
 - Both the `desktop` (desktop app) and `web` (`dsh web`) profiles are supported; any other profile has to add the package to its own bundle list. Installing into the wrong profile does not error — the Session map switch simply never appears.
 - Two DSH Web instances sharing one profile write the same `workspaces.json`. A cross-process write lock and external-modification warnings exist, but last-writer-wins replacement remains possible; run one instance.
 - During v3 migration, legacy tool cards pair each call with the next result by order. Live events pair by `callId`.
+- Arrows and lines have **free endpoints**; they do not snap to cards. While a group is collapsed its member cards are not rendered, so their text is not in the DOM.
+- Images accept png / jpeg / webp / gif only — **SVG is rejected** on purpose (a vector file would be script-capable on the DSH origin). Uploads are capped at 8 MiB and the browser downsizes to a 1600px long edge first.
+- A custom composition that does not mount the DSH attachment store answers 503 on the image routes; notes, shapes and groups keep working.
 
 ## Development and releases
 

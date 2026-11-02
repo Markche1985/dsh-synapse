@@ -59,7 +59,38 @@ By default, Synapse stores canvas metadata at:
 $DSH_HOME/synapse/workspaces.json
 ```
 
-The file contains organizational state such as workspace mapping, card layout, and fork anchors. It does not replace session logs.
+The file contains organizational state such as workspace mapping, card layout, annotation nodes, and fork anchors. It does not replace session logs. The current format is **version 6**; `normalizeState()` migrates v2–v5 on load.
+
+Why layout is server-side and not in the browser: the desktop app launches its profile with `--host 127.0.0.1 --port 0`, so the page origin (and therefore `localStorage` and `IndexedDB`) changes on every restart. Browser-local canvas state is only a cache; `workspace.cardPositions` is the durable copy and the client merges it with host values winning.
+
+## Annotation layer
+
+`workspace.nodes[]` holds the canvas primitives drawn beside the conversation graph:
+
+| `type` | Geometry | Payload |
+|---|---|---|
+| `note` | `x, y, width, height` | `text` (≤ 4000), `color` |
+| `image` | `x, y, width, height` | `image`: the DSH attachment reference only |
+| `shape` (`rect`, `ellipse`) | `x, y, width, height` | `stroke`, `strokeWidth`, `fill` |
+| `shape` (`line`, `arrow`) | `x1, y1, x2, y2` | `stroke`, `strokeWidth` |
+| `frame` | `x, y, width, height` | `title`, `collapsed`, `memberCards`, `memberNodes` |
+
+Group membership names a card by its **position key** (`${threadId}:turn-index:${n}`), never by the card id: the id changes once DSH assigns a source sequence. The host keeps `thread.frameId` in sync with the frame's member list, so a card cannot point at a frame that no longer holds it.
+
+Write routes, all under the existing `/synapse/api` prefix and behind the same Host check:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/workspaces/:id/nodes` | create one node |
+| `PATCH` | `/nodes/:id` | patch one node |
+| `DELETE` | `/nodes/:id` | delete one node, releasing frame members |
+| `PATCH` | `/workspaces/:id` | merge `cardPositions` (never replaces the map) |
+| `POST` | `/workspaces/:id/images` | raw image bytes, own 8 MiB ceiling |
+| `GET` | `/assets/:attachmentId` | image bytes for a referenced attachment |
+
+Image bytes never enter `workspaces.json`. The upload route hands them to the DSH attachment store (`ctx.get('attachments').saveImage`) and returns the content-addressed receipt (`sha256:<64hex>`, media type, dimensions, byte length); the node stores that receipt, so the metadata file stays small (issue #42). The asset route serves **only** attachments some node still references, and only raster types — SVG is refused, because a vector file would be script-capable on the origin the canvas is served from. `ctx.get()` is the read-without-inject accessor: a composition without the attachment service answers 503 on the two image routes and every other annotation feature keeps working.
+
+Painted order inside `.canvas-content` is `.connectors` → `.cards-layer` (group frames first, then cards) → `.notes-layer` → `.shapes-layer`. Every layer carries a `data-morph-key`, because the canvas is reconciled by `morphInto` and an unkeyed overlay node would make the morph re-create the card list.
 
 Consequences:
 

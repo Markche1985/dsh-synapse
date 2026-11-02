@@ -25,6 +25,10 @@ button.primary:hover { border-color: #000; background: #000; color: #fff; }
 .canvas-controls button { min-width: 32px; padding: 0 8px; font-size: 12px; display: inline-flex; align-items: center; gap: 4px; }
 .canvas-controls button svg { width: 14px; height: 14px; flex: none; }
 .canvas-controls span { min-width: 42px; color: #64748b; font-size: 12px; text-align: center; }
+/* Annotation tools reuse the toolbar button grammar above; `.active` marks the
+   tool the next drag will draw (app.js keeps exactly one tool armed). */
+.canvas-controls button.active, .canvas-controls button[aria-pressed="true"] { border-color: #3478f6; background: #eef4ff; color: #2563eb; }
+.canvas-controls button.active:hover, .canvas-controls button[aria-pressed="true"]:hover { border-color: #2563eb; background: #e2edff; color: #2563eb; }
 .sidebar { grid-row: 1 / -1; display: flex; flex-direction: column; gap: 0; min-height: 0; padding: 6px 12px; border-right: 1px solid #e5e7eb; background: #f8f9fa; }
 .new-workspace { display: flex; width: calc(100% - 4px); min-height: auto; height: 38px; align-items: center; justify-content: center; gap: 6px; margin: 0 2px 8px; border-color: rgba(0,0,0,.1); border-radius: 12px; background: #fff; padding: 8px 16px; color: #111827; font-size: 14px; font-weight: 500; }
 .new-session-icon { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.5; }
@@ -80,6 +84,19 @@ button.primary:hover { border-color: #000; background: #000; color: #fff; }
 .connectors path.active-connector { stroke: #3478f6; }
 .connectors .draft-connector { stroke: #3478f6; stroke-dasharray: 5 4; }
 .cards-layer { position: absolute; inset: 0; }
+/* Annotation layers sit next to `.cards-layer` (never inside it) so morphing
+   the card list cannot reparent a note. Both are click-through; only their own
+   children take the pointer, which keeps panning on the empty canvas working.
+   Stacking: notes 5 > shapes 4 > cards (auto), all well under the inspector
+   (30), the fixed toolbar (80) and the selection follow-up (90). */
+.notes-layer, .shapes-layer { position: absolute; inset: 0; pointer-events: none; }
+.notes-layer { z-index: 5; }
+.shapes-layer { z-index: 4; width: 100%; height: 100%; overflow: visible; }
+.notes-layer > *, .shapes-layer > .canvas-shape { pointer-events: auto; }
+/* Marquee select: drawn above every node so the rubber band stays readable,
+   still below the fixed chrome. */
+.canvas-marquee { position: absolute; z-index: 6; border: 1px solid #3478f6; border-radius: 3px; background: rgba(52,120,246,.08); pointer-events: none; }
+.canvas-marquee[hidden] { display: none; }
 .thread-card { position: absolute; display: grid; width: 310px; height: 276px; grid-template-rows: auto auto minmax(0, 1fr) auto; border: 1px solid #d8e0e8; border-radius: 7px; background: #fff; box-shadow: 0 3px 11px rgba(33,48,67,.08); overflow: visible; }
 /* The graph buttons hang 12px outside the card (`right: -12px`), so a card that
    comes later in DOM order used to paint its own body over that overhang and
@@ -201,6 +218,64 @@ button.primary:hover { border-color: #000; background: #000; color: #fff; }
 .draft-actions button { display: grid; width: 32px; height: 32px; min-height: 32px; place-items: center; border-radius: 50%; background: #fff; padding: 0; color: #64748b; line-height: 0; }
 .draft-actions button.primary { border-color: #3478f6; background: #3478f6; color: #fff; }
 .draft-actions svg { display: block; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+/* ── Annotation nodes: sticky notes, pasted images, group frames, shapes ──
+   Same visual grammar as `.thread-card` (1px #d8e0e8, 7px radius, the shared
+   soft shadow) so canvas annotations read as part of the same product. */
+.canvas-note { position: absolute; display: flex; flex-direction: column; border: 1px solid #e8d9a8; border-radius: 7px; background: #fffbe8; box-shadow: 0 3px 11px rgba(33,48,67,.08); }
+.canvas-note-body { flex: 1; min-height: 0; overflow: auto; padding: 8px 10px 16px; color: #3f3a22; font-size: 13px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; cursor: text; scrollbar-color: #d8c99a transparent; scrollbar-width: thin; }
+.canvas-note-body::-webkit-scrollbar { width: 6px; height: 0; }
+.canvas-note-body::-webkit-scrollbar-track { background: transparent; }
+.canvas-note-body::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 999px; background: #d8c99a; background-clip: padding-box; }
+.canvas-note-body::-webkit-scrollbar-thumb:hover { background: #c8b783; }
+/* Resize grip: the contract's note DOM has no grip element, so the affordance
+   is a pseudo-element and stays decorative (the gesture lives on `.canvas-note`). */
+.canvas-note::after { content: ''; position: absolute; right: 3px; bottom: 3px; width: 12px; height: 12px; border-right: 2px solid #cdb87a; border-bottom: 2px solid #cdb87a; border-bottom-right-radius: 3px; pointer-events: none; }
+.canvas-image { position: absolute; display: block; margin: 0; border: 1px solid #d8e0e8; border-radius: 7px; background: #fff; padding: 4px; box-shadow: 0 3px 11px rgba(33,48,67,.08); }
+.canvas-image-img { display: block; width: 100%; height: 100%; border-radius: 3px; object-fit: contain; user-select: none; -webkit-user-drag: none; }
+/* Group frame: first child of `.cards-layer`, so it paints under the cards.
+   Only the header drags the whole group; `.collapsed` keeps the header alone. */
+.canvas-frame { position: absolute; display: flex; flex-direction: column; border: 1px dashed #c7d3e0; border-radius: 7px; background: rgba(255,255,255,.45); }
+.canvas-frame-head { display: flex; height: 34px; min-height: 34px; flex: none; align-items: center; gap: 6px; padding: 0 5px 0 10px; cursor: grab; user-select: none; }
+.canvas-frame-head:active { cursor: grabbing; }
+.canvas-frame-title { min-width: 0; flex: 1; overflow: hidden; color: #55657a; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.canvas-frame-count { display: inline-grid; min-width: 18px; height: 18px; flex: none; place-items: center; border-radius: 9px; background: #eef4ff; padding: 0 5px; color: #3478f6; font-size: 10px; font-weight: 650; }
+.canvas-frame-toggle { display: grid; width: 22px; height: 22px; min-height: 22px; flex: none; place-items: center; border: 0; border-radius: 5px; background: transparent; padding: 0; color: #64748b; }
+.canvas-frame-toggle:hover { background: #eef2f6; color: #1f2937; }
+.canvas-frame-toggle svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; transition: transform 150ms ease; }
+.canvas-frame.collapsed { height: 34px !important; min-height: 34px; overflow: hidden; }
+.canvas-frame.collapsed .canvas-frame-toggle svg { transform: rotate(-90deg); }
+/* A frame is background: only its header may take the pointer, so the empty
+   area inside a group keeps panning and marquee-selecting the canvas. The
+   collapsed variants spell out the same contract for the header-only state. */
+.canvas-frame { pointer-events: none; }
+.canvas-frame-head { pointer-events: auto; }
+.canvas-frame.collapsed { pointer-events: none; }
+.canvas-frame.collapsed .canvas-frame-head { pointer-events: auto; }
+/* Shapes: the visible stroke carries the node's own stroke-width attribute, the
+   transparent hit twin widens it to a 14px grab band. `pointer-events: stroke`
+   keeps the shape's interior click-through, so a large rect drawn over cards
+   never blocks panning or the cards underneath. */
+.canvas-shape { cursor: move; }
+.canvas-shape-visible { fill: none; stroke: #3d4d63; }
+.canvas-shape-hit { fill: transparent; stroke: transparent; stroke-width: 14; stroke-linecap: round; stroke-linejoin: round; pointer-events: stroke; cursor: move; }
+/* Endpoint / resize handles are plain `<circle>`s inside the shape group; they
+   must opt back into hit-testing (the layer is click-through) and they need a
+   dark fill so the white dots don't glare on the dark canvas. */
+.canvas-shape-handle { fill: #fff; stroke: #3478f6; stroke-width: 2; cursor: grab; pointer-events: all; }
+.canvas-shape-handle:active { cursor: grabbing; }
+.shapes-layer marker path, .shapes-layer marker polygon { fill: #3d4d63; }
+/* One shared remove affordance: 24px, hidden until the node is hovered, focused
+   or selected, and it stays reachable inside the frame header row. */
+.canvas-node-remove { position: absolute; top: -10px; right: -10px; z-index: 1; display: grid; width: 24px; height: 24px; min-height: 24px; place-items: center; border: 1px solid #d8e0e8; border-radius: 6px; background: #fff; padding: 0; color: #64748b; font-size: 14px; line-height: 1; opacity: 0; transition: opacity 120ms ease, background 150ms ease, border-color 150ms ease, color 150ms ease; }
+.canvas-note:hover .canvas-node-remove, .canvas-note:focus-within .canvas-node-remove, .canvas-note.selected .canvas-node-remove,
+.canvas-image:hover .canvas-node-remove, .canvas-image:focus-within .canvas-node-remove, .canvas-image.selected .canvas-node-remove,
+.canvas-frame:hover .canvas-node-remove, .canvas-frame:focus-within .canvas-node-remove, .canvas-frame.selected .canvas-node-remove { opacity: 1; }
+.canvas-node-remove:hover, .canvas-node-remove:focus-visible { border-color: #e5484d; background: #e5484d; color: #fff; opacity: 1; }
+.canvas-frame-head .canvas-node-remove { position: static; top: auto; right: auto; width: 22px; height: 22px; min-height: 22px; border-radius: 5px; font-size: 13px; }
+/* Selection: DOM nodes share one ring; SVG groups switch their stroke instead
+   (an outline on a `<g>` would trace nothing but the bounding box). */
+.canvas-note.selected, .canvas-image.selected, .canvas-frame.selected { outline: 2px solid #2f6fd0; outline-offset: 2px; }
+.canvas-shape.selected .canvas-shape-visible { stroke: #2f6fd0; }
 .empty-canvas, .compare-empty { display: grid; align-content: center; justify-items: center; height: 100%; padding: 32px; text-align: center; }
 .empty-canvas strong, .compare-empty strong { color: #334155; font-size: 16px; }
 .empty-canvas p, .compare-empty p { max-width: 460px; color: #64748b; font-size: 13px; line-height: 1.65; }
@@ -294,6 +369,11 @@ button.primary:hover { border-color: #000; background: #000; color: #fff; }
 @media (max-width: 760px) { .synapse-shell { --sidebar-width: 200px; --sidebar-half: 100px; } .synapse-shell.sidebar-collapsed { --sidebar-width: 56px; --sidebar-half: 28px; } .sidebar { padding: 6px 10px; } .detail-head { display: grid; gap: 12px; padding: 22px 18px 14px; } .detail-scroll { padding: 16px 18px 20px; } .message-composer { padding: 12px 18px 16px; } .message-user { max-width: 92%; } .compare-view { padding: 26px 18px; } .compare-columns { grid-template-columns: 1fr; } .topbar { padding: 0 10px; } .brand strong { display: none; } .card-inspector { top: auto; width: 100%; min-width: 0; max-height: 78%; border-top: 1px solid #dbe3ec; border-left: 0; } .card-inspector.is-opening, .card-inspector.is-closing { transform: translateY(24px); } }
 @media (max-width: 560px) { .synapse-shell { min-width: 0; grid-template-columns: 1fr; } .sidebar { display: none; } .topbar, .main-stage { grid-column: 1; }  .top-actions > button { font-size: 11px; padding: 0 7px; } .thread-card { width: 280px; } }
 @media (prefers-reduced-motion: reduce) { .card-inspector { transition: opacity 120ms ease; } .card-inspector.is-opening, .card-inspector.is-closing { transform: none; } }
+/* Narrow screens: the annotation tools would push the zoom controls off the
+   viewport, so the toolbar wraps and its buttons tighten; notes and frames are
+   world-space, so they scale with the canvas instead of the card width. */
+@media (max-width: 760px) { .canvas-controls { max-width: calc(100% - 24px); flex-wrap: wrap; justify-content: flex-end; row-gap: 5px; } }
+@media (max-width: 560px) { .canvas-controls { gap: 4px; } .canvas-controls button { min-width: 28px; padding: 0 6px; } .canvas-frame-head { gap: 4px; padding: 0 4px 0 8px; } }
 
 /* ── Dark theme: follows DSH's body[data-ds-dark-theme] via synapse:theme ── */
 [data-theme="dark"] { color-scheme: dark; }
@@ -447,4 +527,25 @@ button.primary:hover { border-color: #000; background: #000; color: #fff; }
 [data-theme="dark"] button:hover { border-color: #4a4f57; background: #26282d; color: #fff; }
 [data-theme="dark"] button.primary { border-color: #3478f6; background: #3478f6; color: #fff; }
 [data-theme="dark"] button.primary:hover { border-color: #2563eb; background: #2563eb; color: #fff; }
+[data-theme="dark"] .canvas-controls button.active, [data-theme="dark"] .canvas-controls button[aria-pressed="true"] { border-color: #5b8def; background: #1e2a44; color: #7ea6f5; }
+[data-theme="dark"] .canvas-controls button.active:hover, [data-theme="dark"] .canvas-controls button[aria-pressed="true"]:hover { border-color: #7ea6f5; background: #24345a; color: #9fc0ff; }
+[data-theme="dark"] .canvas-note { border-color: #4a3f1f; background: #2b2617; box-shadow: 0 3px 11px rgba(0,0,0,.35); }
+[data-theme="dark"] .canvas-note-body { color: #e8e2cc; scrollbar-color: #6b5f33 transparent; }
+[data-theme="dark"] .canvas-note-body::-webkit-scrollbar-thumb { background: #6b5f33; }
+[data-theme="dark"] .canvas-note-body::-webkit-scrollbar-thumb:hover { background: #857541; }
+[data-theme="dark"] .canvas-note::after { border-color: #6b5f33; }
+[data-theme="dark"] .canvas-image { border-color: #2a2d33; background: #1b1c1f; }
+[data-theme="dark"] .canvas-frame { border-color: #3a3f47; background: rgba(21,23,27,.45); }
+[data-theme="dark"] .canvas-frame-title { color: #a7adb5; }
+[data-theme="dark"] .canvas-frame-count { background: #1e2a44; color: #7ea6f5; }
+[data-theme="dark"] .canvas-frame-toggle { color: #a7adb5; }
+[data-theme="dark"] .canvas-frame-toggle:hover { background: #26282d; color: #e6e8eb; }
+[data-theme="dark"] .canvas-shape-visible { stroke: #9fb0c4; }
+[data-theme="dark"] .canvas-shape-handle { fill: #1b1c1f; stroke: #5b8def; }
+[data-theme="dark"] .shapes-layer marker path, [data-theme="dark"] .shapes-layer marker polygon { fill: #9fb0c4; }
+[data-theme="dark"] .canvas-shape.selected .canvas-shape-visible { stroke: #7ea6f5; }
+[data-theme="dark"] .canvas-note.selected, [data-theme="dark"] .canvas-image.selected, [data-theme="dark"] .canvas-frame.selected { outline-color: #7ea6f5; }
+[data-theme="dark"] .canvas-node-remove { border-color: #3a3f47; background: #222428; color: #a7adb5; }
+[data-theme="dark"] .canvas-node-remove:hover, [data-theme="dark"] .canvas-node-remove:focus-visible { border-color: #e5484d; background: #e5484d; color: #fff; }
+[data-theme="dark"] .canvas-marquee { border-color: #5b8def; background: rgba(91,141,239,.14); }
 @media (max-width: 760px) { [data-theme="dark"] .card-inspector { border-top-color: #2a2d33; border-left: 0; } }
